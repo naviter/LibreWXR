@@ -22,10 +22,12 @@ from librewxr.data.nowcast import NowcastGenerator, NowcastStore
 from librewxr.data.nwp_source import NWPChain
 from librewxr.data.store import FrameStore
 from librewxr.sources import (
+    collect_lightning_contributions,
     collect_nowcast_contributions,
     collect_nwp_contributions,
     collect_radar_coverage_metadata,
     collect_satellite_contributions,
+    lightning_source_slug,
     nwp_grid_slug,
     satellite_source_slug,
 )
@@ -68,6 +70,9 @@ _LOG_TAGS = {
     "librewxr.tiles.cache": "tiles",
     "librewxr.tiles.renderer": "tiles",
     "librewxr.tiles.satellite_renderer": "tiles",
+    "librewxr.sources.lightning.glm.source": "glm",
+    "librewxr.sources.lightning.mtg_li.source": "mtg-li",
+    "librewxr.sources.lightning._common": "lightning",
     "librewxr.tiles.coordinates": "tiles",
     "librewxr.data.alerts_fetcher": "alerts",
     "librewxr.data.alerts_store": "alerts",
@@ -176,6 +181,10 @@ async def _render_only_lifespan(app: FastAPI):
     satellite_grids_by_slug: dict[str, object] = {
         satellite_source_slug(c): c.instance for c in satellite_contribs
     }
+    lightning_contribs = collect_lightning_contributions(settings, cache_dir)
+    lightning_grids_by_slug: dict[str, object] = {
+        lightning_source_slug(c): c.instance for c in lightning_contribs
+    }
     nowcast_store = NowcastStore(cache_dir=cache_dir) if settings.nowcast_enabled else None
     alerts_store = AlertsStore() if settings.alerts_enabled else None
 
@@ -183,6 +192,7 @@ async def _render_only_lifespan(app: FastAPI):
         "frame_store": store,
         **nwp_grids_by_slug,
         **satellite_grids_by_slug,
+        **lightning_grids_by_slug,
         "nowcast_store": nowcast_store,
         "alerts_store": alerts_store,
     }
@@ -213,6 +223,11 @@ async def _render_only_lifespan(app: FastAPI):
     satellite_grids_by_slug = {
         slug: stores[slug]
         for slug in satellite_grids_by_slug
+        if stores[slug] is not None
+    }
+    lightning_grids_by_slug = {
+        slug: stores[slug]
+        for slug in lightning_grids_by_slug
         if stores[slug] is not None
     }
     ecmwf_grid = nwp_grids_by_slug.get("ecmwf_grid")
@@ -269,6 +284,7 @@ async def _render_only_lifespan(app: FastAPI):
     routes.ecmwf_grid = ecmwf_grid
     routes.nwp_chain = nwp_chain
     routes.satellite_grids = satellite_grids_by_slug
+    routes.lightning_grids = lightning_grids_by_slug
     routes.tile_warmer = None
     routes.nowcast_store = nowcast_store
     routes.tile_request_tracker = tile_request_tracker
@@ -373,6 +389,15 @@ async def lifespan(app: FastAPI):
         logger.info(
             "Satellite chain: [%s]",
             ", ".join(c.name for c in satellite_contribs),
+        )
+    lightning_contribs = collect_lightning_contributions(settings, nwp_cache_dir)
+    lightning_grids_by_slug: dict[str, object] = {
+        lightning_source_slug(c): c.instance for c in lightning_contribs
+    }
+    if lightning_contribs:
+        logger.info(
+            "Lightning chain: [%s]",
+            ", ".join(c.name for c in lightning_contribs),
         )
     enabled = settings.get_enabled_regions()
 
@@ -480,6 +505,7 @@ async def lifespan(app: FastAPI):
     routes.ecmwf_grid = ecmwf_grid
     routes.nwp_chain = nwp_chain
     routes.satellite_grids = satellite_grids_by_slug
+    routes.lightning_grids = lightning_grids_by_slug
     routes.tile_warmer = warmer
     routes.nowcast_store = nowcast_store
     routes.tile_request_tracker = tile_request_tracker
@@ -510,6 +536,7 @@ async def lifespan(app: FastAPI):
         store, cache,
         nwp_contributions=nwp_contribs,
         satellite_contributions=satellite_contribs,
+        lightning_contributions=lightning_contribs,
         nowcast_generator=nowcast_generator,
         warmer=warmer,
         radar_cache=radar_cache,

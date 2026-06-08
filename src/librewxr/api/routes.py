@@ -57,6 +57,11 @@ nwp_chain = None  # NWPChain | None
 # Routes index by slug so the /health endpoint and tile dispatcher
 # auto-pick up new channels without per-source plumbing.
 satellite_grids: dict[str, object] = {}
+# Lightning networks keyed by slug (glm_grid, mtg_li_grid).  Point data,
+# no grid — the /v2/lightning endpoint merges every network's flashes and
+# the /health endpoint iterates this dict, so adding a network needs no
+# edits here.
+lightning_grids: dict[str, object] = {}
 tile_warmer = None  # TileWarmer | None
 nowcast_store = None  # NowcastStore | None
 radar_cache = None  # RadarFrameCache | None
@@ -145,10 +150,15 @@ async def health():
         for grid in satellite_grids.values()
         if grid is not None
     )
+    lightning_bytes = sum(
+        grid.data_bytes
+        for grid in lightning_grids.values()
+        if grid is not None
+    )
     coord_bytes = coord_cache_bytes()
     tracked_bytes = (
         radar_bytes + tile_cache_bytes + sum(nwp_bytes_by_slug.values())
-        + nowcast_bytes + satellite_bytes + coord_bytes
+        + nowcast_bytes + satellite_bytes + lightning_bytes + coord_bytes
     )
     other_bytes = max(0, rss_bytes - tracked_bytes)
 
@@ -161,6 +171,7 @@ async def health():
     breakdown.update({
         "nowcast_mb": round(nowcast_bytes / (1024 * 1024), 1),
         "satellite_mb": round(satellite_bytes / (1024 * 1024), 1),
+        "lightning_mb": round(lightning_bytes / (1024 * 1024), 1),
         "coord_caches_mb": round(coord_bytes / (1024 * 1024), 1),
         "other_mb": round(other_bytes / (1024 * 1024), 1),
     })
@@ -209,6 +220,22 @@ async def health():
                     ),
                 }
                 for slug, grid in satellite_grids.items()
+            },
+        },
+        "lightning": {
+            "enabled": settings.lightning_enabled,
+            "networks": {
+                slug: {
+                    "loaded": grid is not None and grid.flash_count > 0,
+                    "flashes": grid.flash_count if grid is not None else 0,
+                    "slots": len(grid.timestamps) if grid is not None else 0,
+                    "latest": (
+                        grid.timestamps[-1]
+                        if grid is not None and grid.timestamps
+                        else None
+                    ),
+                }
+                for slug, grid in lightning_grids.items()
             },
         },
         "enabled_regions": enabled_regions or [],
@@ -290,6 +317,85 @@ async def weather_maps() -> WeatherMapsResponse:
         host=host,
         radar=RadarData(past=past, nowcast=nowcast, colorSchemes=color_schemes),
         satellite=SatelliteData(infrared=infrared),
+    )
+
+
+@router.get("/v2/lightning")
+async def lightning(
+    since: int = Query(default=600, ge=1, le=7200),
+    bbox: str = Query(default=""),
+) -> Response:
+    """Recent lightning flashes as points, merged across every network.
+
+    Each flash is a cross-hair on the frontend, faded by age.  Returns
+    ``{generated, since, count, attribution, flashes: [{t, lat, lon,
+    energy, age}]}`` where ``age`` is seconds since the strike (the
+    frontend's fade input) and ``t`` is the strike's unix time.
+
+    Query params:
+      ``since``  look-back window in seconds (default 600 = 10 min).
+      ``bbox``   optional ``min_lon,min_lat,max_lon,max_lat`` viewport
+                 filter — clip server-side so a zoomed-in client doesn't
+                 ship the whole disk's flashes.
+
+    503 when the lightning layer is disabled, mirroring the satellite
+    tile path's behaviour.
+    """
+    if not settings.lightning_enabled or not lightning_grids:
+        raise HTTPException(status_code=503, detail="Lightning layer disabled")
+
+    parsed_bbox: tuple[float, float, float, float] | None = None
+    if bbox:
+        try:
+            parts = [float(v) for v in bbox.split(",")]
+            if len(parts) != 4:
+                raise ValueError
+            parsed_bbox = (parts[0], parts[1], parts[2], parts[3])
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="bbox must be 'min_lon,min_lat,max_lon,max_lat'",
+            )
+
+    now = int(time.time())
+    flashes: list[dict] = []
+    networks: list[str] = []
+    for grid in lightning_grids.values():
+        if grid is None:
+            continue
+        networks.append(getattr(grid, "name", "lightning"))
+        for ts, lat, lon, energy in grid.flashes_since(since, parsed_bbox):
+            flashes.append({
+                "t": ts,
+                "lat": round(lat, 4),
+                "lon": round(lon, 4),
+                "energy": energy,
+                "age": max(0, now - ts),
+            })
+
+    # Newest last so the frontend can draw older cross-hairs first and let
+    # fresh strikes paint on top.
+    flashes.sort(key=lambda f: f["t"])
+
+    # NOAA GLM is CC0 (attribution requested); EUMETSAT MTG-LI requires it.
+    attribution = "Lightning: " + ", ".join(sorted(set(networks)))
+    if any("MTG-LI" in n for n in networks):
+        attribution += " © EUMETSAT"
+    if any("GLM" in n for n in networks):
+        attribution += " — data: NOAA/NESDIS"
+
+    import json
+    body = json.dumps({
+        "generated": now,
+        "since": since,
+        "count": len(flashes),
+        "attribution": attribution,
+        "flashes": flashes,
+    })
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Cache-Control": "no-cache"},
     )
 
 

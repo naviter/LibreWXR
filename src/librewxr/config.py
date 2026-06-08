@@ -98,6 +98,53 @@ class Settings(BaseSettings):
     # publishes one frame per hour, so 12 ≈ 12 hours of animation.
     # At ~15 MB per channel per frame, 12 × 2 channels ≈ 360 MB resident.
     satellite_max_frames: int = 12
+    # Master switch for the lightning layer.  Backs the /v2/lightning
+    # endpoint with individual flash points (cross-hair markers on the
+    # frontend, age-based fade).  Two networks feed it, merged at query
+    # time:
+    #   GLM    - NOAA GOES-GLM total lightning over the Americas.  CC0
+    #            public domain via NOAA NODD, anonymous S3, always on.
+    #   MTG-LI - EUMETSAT Meteosat Third Generation Lightning Imager over
+    #            Europe / Africa / South America.  Free with attribution,
+    #            but needs a (free) EUMETSAT account: stays dormant until
+    #            ``eumetsat_key`` / ``eumetsat_secret`` are set.
+    # When False the endpoint returns 503 and no network is instantiated
+    # (same pattern as ``satellite_enabled``).  Per-network toggles below
+    # still apply when this is True.
+    lightning_enabled: bool = True
+    # Per-network toggles.  GLM is anonymous and on by default; MTG-LI is
+    # on by default too but self-gates on credentials, so leaving it True
+    # without a key is a no-op rather than an error.
+    glm_enabled: bool = True
+    mtg_li_enabled: bool = True
+    # GLM source buckets.  As of 2025 GOES-East is GOES-19 and GOES-West
+    # is GOES-18 (GOES-16 is on-orbit standby).  Both are anonymous NOAA
+    # Open Data buckets; the GLM-L2-LCFA product path is identical under
+    # each.  Comma-separated so a deployment can fetch one satellite only.
+    glm_s3_buckets: str = "noaa-goes19,noaa-goes18"
+    glm_s3_region: str = "us-east-1"
+    # Rolling retention window for flashes, in minutes.  Every flash older
+    # than this is dropped on each fetch.  30 min ≈ what a "recent strikes"
+    # overlay wants; the frontend fades cross-hairs to nothing well before
+    # the window edge.  Bounds memory: GLM peaks at low-thousands of
+    # flashes/min globally, so 30 min is a few hundred KB of points.
+    lightning_retention_minutes: int = 30
+    # How far back each fetch reaches for new GLM granules, in minutes.
+    # GLM publishes one ~20 s LCFA granule per satellite continuously, so
+    # a 5-min window is ~15 granules/satellite/fetch — enough to bridge
+    # the 10-min fetch cadence with overlap without pulling the whole
+    # retention window every cycle.  Granules already ingested are skipped.
+    glm_fetch_window_minutes: int = 12
+    # EUMETSAT Data Store (EUMDAC) OAuth credentials for MTG-LI.  Create a
+    # free account at https://user.eumetsat.int and copy the consumer key
+    # + secret from your API key page.  Empty (the default) keeps MTG-LI
+    # dormant.  Attribution to EUMETSAT is required when these data are
+    # displayed (see docs/adding-a-source.md → lightning).
+    eumetsat_key: str = ""
+    eumetsat_secret: str = ""
+    eumetsat_base_url: str = "https://api.eumetsat.int"
+    # MTG-LI Level-2 Lightning Flashes collection ID in the Data Store.
+    mtg_li_collection: str = "EO:EUM:DAT:0691"
     # US-side radar data source (USCOMP / AKCOMP / HICOMP / PRCOMP / GUCOMP).
     # Three modes:
     #   mrms_fallback  - (default) MRMS primary + IEM fallback when MRMS fails.

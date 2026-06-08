@@ -40,10 +40,12 @@ from librewxr.data.radar_cache import RadarFrameCache
 from librewxr.data.regions import REGIONS
 from librewxr.data.store import FrameStore
 from librewxr.sources import (
+    collect_lightning_contributions,
     collect_nowcast_contributions,
     collect_nwp_contributions,
     collect_radar_coverage_metadata,
     collect_satellite_contributions,
+    lightning_source_slug,
     nwp_grid_slug,
     satellite_source_slug,
 )
@@ -140,6 +142,17 @@ async def run_pipeline() -> None:
             ", ".join(c.name for c in satellite_contribs),
         )
 
+    # Lightning networks — GLM (anonymous) + MTG-LI (credentialed).
+    lightning_contribs = collect_lightning_contributions(settings, cache_dir)
+    lightning_grids_by_slug = {
+        lightning_source_slug(c): c.instance for c in lightning_contribs
+    }
+    if lightning_contribs:
+        logger.info(
+            "Lightning chain: [%s]",
+            ", ".join(c.name for c in lightning_contribs),
+        )
+
     station_map, range_overrides, coverage_polygons = collect_radar_coverage_metadata(settings)
     build_coverage_masks(
         station_map,
@@ -193,6 +206,7 @@ async def run_pipeline() -> None:
         "frame_store": store,
         **nwp_grids_by_slug,
         **satellite_grids_by_slug,
+        **lightning_grids_by_slug,
         "nowcast_store": nowcast_store,
         "alerts_store": alerts_store,
     }
@@ -207,6 +221,7 @@ async def run_pipeline() -> None:
         store, tile_cache,
         nwp_contributions=nwp_contribs,
         satellite_contributions=satellite_contribs,
+        lightning_contributions=lightning_contribs,
         nowcast_generator=nowcast_generator,
         warmer=None,  # tile warming is the render workers' job
         radar_cache=radar_cache,
