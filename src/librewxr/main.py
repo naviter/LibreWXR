@@ -608,8 +608,11 @@ if os.path.isdir(_examples_dir):
     app.mount("/examples", StaticFiles(directory=_examples_dir), name="examples")
 
 @app.get("/", include_in_schema=False)
-async def root():
-    return RedirectResponse(url="/examples/maplibre.html")
+async def root(request: Request):
+    # Preserve the query string (e.g. ?key=...) so the viewer can read it.
+    query = request.url.query
+    target = "/examples/maplibre.html" + (f"?{query}" if query else "")
+    return RedirectResponse(url=target)
 
 
 @app.exception_handler(StarletteHTTPException)
