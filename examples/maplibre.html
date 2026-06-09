@@ -336,6 +336,10 @@
         <option value="light">Arrows: Light</option>
         <option value="dark">Arrows: Dark</option>
     </select>
+    <select id="lightningToggle" onchange="changeLightning()">
+        <option value="off">Lightning: Off</option>
+        <option value="on">Lightning: On</option>
+    </select>
     <select id="themeSelect" onchange="changeTheme()">
         <option value="dark">Dark Theme</option>
         <option value="light">Light Theme</option>
@@ -607,6 +611,9 @@ function addFrameSourceAndLayer(position, frame, opacity) {
         maxzoom: 12
     });
 
+    // Keep radar/satellite frames below the lightning overlay so strikes
+    // are never hidden behind a freshly added frame layer.
+    var beforeId = map.getLayer('lightning-layer') ? 'lightning-layer' : undefined;
     map.addLayer({
         id: layerId,
         type: 'raster',
@@ -616,7 +623,7 @@ function addFrameSourceAndLayer(position, frame, opacity) {
             'raster-opacity-transition': { duration: 0, delay: 0 },
             'raster-fade-duration': 0
         }
-    });
+    }, beforeId);
 }
 
 function removeFrameSourceAndLayer(position) {
@@ -1187,7 +1194,137 @@ map.on('movestart', function() {
 
 map.on('moveend', function() {
     // No-op — preloading starts when the user clicks play
+    if (lightningOn) pollLightning();
 });
+
+// === LIGHTNING (cross-hair overlay) ===
+// Independent of the radar/satellite scrubber: a live overlay that polls
+// /v2/lightning for the most recent strikes and draws one cross-hair per
+// flash, fading each by age. Rendered as a MapLibre symbol layer (GPU)
+// kept above the radar frames so strikes are never hidden.
+var LIGHTNING_WINDOW = 600;     // seconds of strikes to show (10 min)
+var LIGHTNING_POLL_MS = 20000;  // re-poll cadence
+var LIGHTNING_MAX = 4000;       // cap markers for a busy continental view
+var lightningOn = false;
+var lightningTimer = null;
+var lightningIconsReady = false;
+
+// Draw a cross-hair of `color` into an ImageData for map.addImage().
+// Matches the leaflet viewer: hot amber core fresh, cooling as it ages.
+function makeCrosshairIcon(color) {
+    var px = 2;                 // retina pixelRatio
+    var s = 14, c = s / 2, gap = 2;
+    var cv = document.createElement('canvas');
+    cv.width = s * px; cv.height = s * px;
+    var ctx = cv.getContext('2d');
+    ctx.scale(px, px);
+    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(c, 0);       ctx.lineTo(c, c - gap);
+    ctx.moveTo(c, c + gap); ctx.lineTo(c, s);
+    ctx.moveTo(0, c);       ctx.lineTo(c - gap, c);
+    ctx.moveTo(c + gap, c); ctx.lineTo(s, c);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.arc(c, c, 1, 0, 2 * Math.PI); ctx.fill();
+    return ctx.getImageData(0, 0, s * px, s * px);
+}
+
+function ensureLightningIcons() {
+    if (lightningIconsReady) return;
+    var icons = { 'lightning-hot': '#fff15a', 'lightning-mid': '#ffb347', 'lightning-cool': '#ff7b54' };
+    Object.keys(icons).forEach(function(id) {
+        if (!map.hasImage(id)) map.addImage(id, makeCrosshairIcon(icons[id]), { pixelRatio: 2 });
+    });
+    lightningIconsReady = true;
+}
+
+function ensureLightningLayer() {
+    if (!map.getSource('lightning-src')) {
+        map.addSource('lightning-src', {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: [] }
+        });
+    }
+    if (!map.getLayer('lightning-layer')) {
+        map.addLayer({
+            id: 'lightning-layer',
+            type: 'symbol',
+            source: 'lightning-src',
+            layout: {
+                'icon-image': ['match', ['get', 'bucket'],
+                    0, 'lightning-hot', 1, 'lightning-mid', 'lightning-cool'],
+                'icon-allow-overlap': true,
+                'icon-ignore-placement': true,
+                'icon-size': 1
+            },
+            paint: {
+                // Fade newest = opaque, oldest (window edge) = ~transparent.
+                'icon-opacity': ['interpolate', ['linear'], ['get', 't'], 0, 1.0, 1, 0.1]
+            }
+        });
+    }
+}
+
+function changeLightning() {
+    lightningOn = document.getElementById('lightningToggle').value === 'on';
+    if (lightningOn) {
+        ensureLightningIcons();
+        ensureLightningLayer();
+        pollLightning();
+        if (lightningTimer) clearInterval(lightningTimer);
+        lightningTimer = setInterval(pollLightning, LIGHTNING_POLL_MS);
+    } else {
+        if (lightningTimer) { clearInterval(lightningTimer); lightningTimer = null; }
+        var src = map.getSource('lightning-src');
+        if (src) src.setData({ type: 'FeatureCollection', features: [] });
+    }
+}
+
+function pollLightning() {
+    if (!lightningOn) return;
+    var b = map.getBounds();
+    var bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
+        .map(function(v) { return v.toFixed(3); }).join(',');
+    var url = getHost() + '/v2/lightning?since=' + LIGHTNING_WINDOW + '&bbox=' + bbox;
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.onload = function() {
+        if (!lightningOn) return;
+        if (xhr.status === 503) {
+            alert('Lightning layer is disabled on this server.');
+            document.getElementById('lightningToggle').value = 'off';
+            changeLightning();
+            return;
+        }
+        if (xhr.status < 200 || xhr.status >= 300) return;
+        try {
+            var data = JSON.parse(xhr.responseText);
+            drawFlashes(data.flashes || []);
+        } catch (e) { /* ignore malformed poll */ }
+    };
+    xhr.send();
+}
+
+function drawFlashes(flashes) {
+    var src = map.getSource('lightning-src');
+    if (!src) return;
+    // Cap markers so a continental view of an active day stays responsive;
+    // keep the freshest (list is newest-last from the API).
+    var start = Math.max(0, flashes.length - LIGHTNING_MAX);
+    var features = [];
+    for (var i = start; i < flashes.length; i++) {
+        var f = flashes[i];
+        var t = Math.max(0, Math.min(1, f.age / LIGHTNING_WINDOW));
+        var bucket = t < 0.33 ? 0 : (t < 0.66 ? 1 : 2);
+        features.push({
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: [f.lon, f.lat] },
+            properties: { t: t, bucket: bucket }
+        });
+    }
+    src.setData({ type: 'FeatureCollection', features: features });
+}
 
 // === AUTO-REFRESH ===
 function startAutoRefresh() {
