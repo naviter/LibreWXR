@@ -9,7 +9,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from rich.logging import RichHandler
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -601,6 +602,14 @@ app.add_middleware(
 )
 
 app.include_router(routes.router)
+
+_examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples")
+if os.path.isdir(_examples_dir):
+    app.mount("/examples", StaticFiles(directory=_examples_dir), name="examples")
+
+@app.get("/", include_in_schema=False)
+async def root():
+    return RedirectResponse(url="/examples/maplibre.html")
 
 
 @app.exception_handler(StarletteHTTPException)

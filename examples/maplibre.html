@@ -320,6 +320,7 @@
     <span class="toolbar-title">LibreWXR</span>
     <select id="sourceSelect" onchange="changeSource()">
         <option value="local">Local (localhost:8080)</option>
+        <option value="naviter">Naviter (librewxr.seeyou.cloud)</option>
         <option value="public">Public (api.librewxr.net)</option>
     </select>
     <select id="layerSelect" onchange="changeLayer()">
@@ -393,6 +394,7 @@ var AUTO_REFRESH_MS = 5 * 60 * 1000; // 5 minutes
 
 var SOURCES = {
     local: 'http://localhost:8080',
+    naviter: 'https://librewxr.seeyou.cloud',
     public: 'https://api.librewxr.net'
 };
 
@@ -423,7 +425,8 @@ var isDragging = false;
 (function detectSource() {
     var loc = window.location;
     var isLocal = loc.protocol === 'file:' || loc.hostname === 'localhost' || loc.hostname === '127.0.0.1';
-    activeSource = isLocal ? 'local' : 'public';
+    var isNaviter = loc.hostname === 'librewxr.seeyou.cloud';
+    activeSource = isLocal ? 'local' : isNaviter ? 'naviter' : 'public';
     document.getElementById('sourceSelect').value = activeSource;
 })();
 
