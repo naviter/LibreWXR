@@ -513,11 +513,25 @@ function changeSource() {
 }
 
 function getApiUrl() {
-    return SOURCES[activeSource] + '/public/weather-maps.json';
+    return withKey(SOURCES[activeSource] + '/public/weather-maps.json');
 }
 
 function getHost() {
     return apiData.host || SOURCES[activeSource];
+}
+
+// API-key support: the server requires ?key=<KEY> on /public and /v2.
+// The viewer reads it from its own page URL (e.g. .../maplibre.html?key=XXX)
+// so the key is never hard-coded in the served HTML. Append it to every
+// manifest / tile / lightning request.
+function getKey() {
+    var m = window.location.search.match(/[?&]key=([^&]+)/);
+    return m ? decodeURIComponent(m[1]) : '';
+}
+function withKey(url) {
+    var k = getKey();
+    if (!k) return url;
+    return url + (url.indexOf('?') >= 0 ? '&' : '?') + 'key=' + encodeURIComponent(k);
 }
 
 // === LAYER MODE ===
@@ -591,10 +605,10 @@ function getLayerId(position) {
 
 function getTileUrl(frame) {
     if (activeLayer === 'satellite') {
-        return getHost() + frame.path + '/' + TILE_SIZE + '/{z}/{x}/{y}/0/0_0.webp';
+        return withKey(getHost() + frame.path + '/' + TILE_SIZE + '/{z}/{x}/{y}/0/0_0.webp');
     } else {
         var arrowsParam = arrowsMode ? '?arrows=' + arrowsMode : '';
-        return getHost() + frame.path + '/' + TILE_SIZE + '/{z}/{x}/{y}/' + currentColorScheme + '/1_1.webp' + arrowsParam;
+        return withKey(getHost() + frame.path + '/' + TILE_SIZE + '/{z}/{x}/{y}/' + currentColorScheme + '/1_1.webp' + arrowsParam);
     }
 }
 
@@ -699,7 +713,7 @@ function updateSatelliteBackground() {
 
     removeSatelliteBackground();
 
-    var satUrl = getHost() + latestSat.path + '/' + TILE_SIZE + '/{z}/{x}/{y}/0/0_0.webp';
+    var satUrl = withKey(getHost() + latestSat.path + '/' + TILE_SIZE + '/{z}/{x}/{y}/0/0_0.webp');
 
     map.addSource('sat-bg', {
         type: 'raster',
@@ -1289,7 +1303,7 @@ function pollLightning() {
     var b = map.getBounds();
     var bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
         .map(function(v) { return v.toFixed(3); }).join(',');
-    var url = getHost() + '/v2/lightning?since=' + LIGHTNING_WINDOW + '&bbox=' + bbox;
+    var url = withKey(getHost() + '/v2/lightning?since=' + LIGHTNING_WINDOW + '&bbox=' + bbox);
     var xhr = new XMLHttpRequest();
     xhr.open('GET', url, true);
     xhr.onload = function() {
