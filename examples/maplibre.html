@@ -1202,7 +1202,10 @@ map.on('moveend', function() {
 // /v2/lightning for the most recent strikes and draws one cross-hair per
 // flash, fading each by age. Rendered as a MapLibre symbol layer (GPU)
 // kept above the radar frames so strikes are never hidden.
-var LIGHTNING_WINDOW = 600;     // seconds of strikes to show (10 min)
+// 20 min window — comfortably exceeds the server's 10-min lightning fetch
+// cadence so the layer always has data; age-fade keeps fresh strikes bright
+// and old ones faint. (The server fetches lightning once per radar cycle.)
+var LIGHTNING_WINDOW = 1200;    // seconds of strikes to show (20 min)
 var LIGHTNING_POLL_MS = 20000;  // re-poll cadence
 var LIGHTNING_MAX = 4000;       // cap markers for a busy continental view
 var lightningOn = false;
