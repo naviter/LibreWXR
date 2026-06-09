@@ -603,7 +603,7 @@ app.add_middleware(
 
 app.include_router(routes.router)
 
-_examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..", "examples")
+_examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "examples")
 if os.path.isdir(_examples_dir):
     app.mount("/examples", StaticFiles(directory=_examples_dir), name="examples")
 
