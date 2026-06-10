@@ -15,6 +15,7 @@ from librewxr.api.models import (
     AlertsResponse,
     ColorScheme,
     GeoJSONFeature,
+    LightningData,
     RadarData,
     RadarTimestamp,
     SatelliteData,
@@ -32,6 +33,12 @@ from librewxr.tiles.renderer import (
     render_coverage_tile,
 )
 from librewxr.tiles.request_tracker import TileRequestTracker
+from librewxr.tiles.mvt import (
+    LIGHTNING_LAYER,
+    encode_point_tile,
+    merc_y,
+    quantize_point,
+)
 from librewxr.tiles.satellite_renderer import (
     render_gmgsi_composite_tile,
     render_gmgsi_tile,
@@ -311,12 +318,35 @@ async def weather_maps() -> WeatherMapsResponse:
         for sid, name in SCHEME_NAMES.items()
     ]
 
+    lightning_data: LightningData | None = None
+    if settings.lightning_enabled and lightning_grids:
+        slots: list[int] = []
+        networks: list[str] = []
+        for grid in lightning_grids.values():
+            if grid is None:
+                continue
+            networks.append(getattr(grid, "name", "lightning"))
+            slots.extend(grid.timestamps)
+        if slots:
+            latest_ts = max(slots)
+            attribution = "Lightning: " + ", ".join(sorted(set(networks)))
+            if any("MTG-LI" in n for n in networks):
+                attribution += " © EUMETSAT"
+            if any("GLM" in n for n in networks):
+                attribution += " — data: NOAA/NESDIS"
+            lightning_data = LightningData(
+                time=latest_ts,
+                path=f"/v2/lightning/{latest_ts}",
+                attribution=attribution,
+            )
+
     return WeatherMapsResponse(
         version="2.0",
         generated=int(time.time()),
         host=host,
         radar=RadarData(past=past, nowcast=nowcast, colorSchemes=color_schemes),
         satellite=SatelliteData(infrared=infrared),
+        lightning=lightning_data,
     )
 
 
@@ -395,8 +425,100 @@ async def lightning(
     return Response(
         content=body,
         media_type="application/json",
-        headers={"Cache-Control": "no-cache"},
+        headers={"Cache-Control": "public, max-age=15"},
     )
+
+
+_MVT_CONTENT_TYPE = "application/vnd.mapbox-vector-tile"
+_MVT_BUFFER = 64  # MVT pixels of buffer outside tile extent
+_MVT_MAX_ZOOM = 8
+_MVT_MAX_FEATURES = 8192
+
+
+@router.get("/v2/lightning/{cycle_ts}/{z}/{x}/{y}.mvt")
+async def lightning_mvt_tile(
+    cycle_ts: int,
+    z: int = Path(ge=0, le=_MVT_MAX_ZOOM),
+    x: int = Path(ge=0),
+    y: int = Path(ge=0),
+) -> Response:
+    """Lightning strikes as a Mapbox Vector Tile, keyed by fetch-cycle timestamp.
+
+    ``cycle_ts`` must be a valid fetch-interval-aligned timestamp within the
+    retention window — anything else returns 404 so nginx doesn't cache
+    garbage keys.  Empty ocean tiles return 200 + empty body (not 204 —
+    nginx doesn't cache 204).
+
+    Cache-Control: newest cycle gets max-age=60 (still receiving late
+    granules); older cycles get max-age=3600 (immutable).
+    """
+    if not settings.lightning_enabled or not lightning_grids:
+        raise HTTPException(status_code=503, detail="Lightning layer disabled")
+
+    now = int(time.time())
+    interval = max(settings.fetch_interval, 1)
+    retention = settings.lightning_retention_minutes * 60
+
+    # Reject misaligned or out-of-window timestamps to cap cache-key surface.
+    if cycle_ts % interval != 0:
+        raise HTTPException(status_code=404, detail="cycle_ts not aligned to fetch interval")
+    if not (now - retention - interval <= cycle_ts <= now + interval):
+        raise HTTPException(status_code=404, detail="cycle_ts outside retention window")
+
+    from librewxr.tiles.coordinates import tile_bounds
+
+    west, south, east, north = tile_bounds(z, x, y)
+    north_merc = merc_y(north)
+    south_merc = merc_y(south)
+
+    # Expand the query bbox by the buffer so edge flashes appear in adjacent tiles.
+    extent = 4096
+    buf_frac = _MVT_BUFFER / extent
+    lon_span = east - west
+    merc_span = north_merc - south_merc
+    query_bbox = (
+        west - lon_span * buf_frac,
+        south - (north - south) * buf_frac,  # approximate lat expansion for query
+        east + lon_span * buf_frac,
+        north + (north - south) * buf_frac,
+    )
+
+    # Collect flashes up to cycle_ts + one interval (newest published slot).
+    query_seconds = retention
+    raw_flashes: list = []
+    for grid in lightning_grids.values():
+        if grid is None:
+            continue
+        for flash in grid.flashes_since(query_seconds, query_bbox):
+            ts, lat, lon, _ = flash
+            if ts <= cycle_ts + interval:
+                raw_flashes.append((ts, lat, lon))
+
+    points: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    # Sort newest-first then dedupe by pixel coord (keep newest).
+    raw_flashes.sort(key=lambda f: -f[0])
+    for ts, lat, lon in raw_flashes:
+        px, py = quantize_point(lat, lon, west, east, north_merc, south_merc, extent)
+        coord = (px, py)
+        if coord not in seen:
+            seen.add(coord)
+            points.append((px, py, ts))
+
+    # Cap and sort so byte-identical tiles come from identical store states.
+    points = points[:_MVT_MAX_FEATURES]
+    points.sort(key=lambda p: (p[2], p[0], p[1]))
+
+    tile_bytes = encode_point_tile(LIGHTNING_LAYER, points, extent)
+
+    # Newest cycle still receiving late granules → short TTL; older = immutable.
+    newest_slot = (now // interval) * interval
+    max_age = 60 if cycle_ts >= newest_slot else 3600
+    headers = {
+        "Cache-Control": f"public, max-age={max_age}",
+        "Content-Type": _MVT_CONTENT_TYPE,
+    }
+    return Response(content=tile_bytes, media_type=_MVT_CONTENT_TYPE, headers=headers)
 
 
 @router.get("/v2/radar/{timestamp}/{size}/{z}/{x}/{y}/{color}/{smooth_snow}.{ext}")

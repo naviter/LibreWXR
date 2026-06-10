@@ -352,6 +352,7 @@
         <span id="preloadText">Loading frames 0/0</span>
         <div class="preload-bar"><div class="preload-fill" id="preloadFill"></div></div>
     </div>
+    <div id="lightning-attribution" style="display:none;position:absolute;bottom:30px;left:10px;z-index:10;background:rgba(0,0,0,0.55);color:#ccc;font-size:11px;padding:3px 7px;border-radius:3px;pointer-events:none;"></div>
     <button class="locate-btn" id="locateBtn" title="Locate me">
         <svg viewBox="0 0 24 24">
             <circle cx="12" cy="12" r="3"/>
@@ -1176,6 +1177,12 @@ function loadApiData() {
         if (xhr.status >= 200 && xhr.status < 300) {
             apiData = JSON.parse(xhr.responseText);
             reinitialize();
+            // Seed lightning cycle from initial manifest.
+            var ld = apiData.lightning;
+            if (ld && ld.time) {
+                lightningCycleTs = ld.time;
+                lightningAttribution = ld.attribution || '';
+            }
         } else {
             document.getElementById('timestampDisplay').textContent = 'API error';
         }
@@ -1208,139 +1215,160 @@ map.on('movestart', function() {
 
 map.on('moveend', function() {
     // No-op — preloading starts when the user clicks play
-    if (lightningOn) pollLightning();
 });
 
-// === LIGHTNING (cross-hair overlay) ===
-// Independent of the radar/satellite scrubber: a live overlay that polls
-// /v2/lightning for the most recent strikes and draws one cross-hair per
-// flash, fading each by age. Rendered as a MapLibre symbol layer (GPU)
-// kept above the radar frames so strikes are never hidden.
-// 20 min window — comfortably exceeds the server's 10-min lightning fetch
-// cadence so the layer always has data; age-fade keeps fresh strikes bright
-// and old ones faint. (The server fetches lightning once per radar cycle.)
-var LIGHTNING_WINDOW = 1200;    // seconds of strikes to show (20 min)
-var LIGHTNING_POLL_MS = 20000;  // re-poll cadence
-var LIGHTNING_MAX = 4000;       // cap markers for a busy continental view
+// === LIGHTNING (vector tile overlay) ===
+// Served as Mapbox Vector Tiles (MVT) from /v2/lightning/{cycle_ts}/{z}/{x}/{y}.mvt.
+// Tiles are immutable per cycle and cached by nginx — no per-client bbox requests.
+// The map's vector renderer handles tile fetching; we only need to:
+//   1) switch the source URL when a new cycle is published (manifest poll, 60s)
+//   2) refresh paint expressions (opacity fade + time filter) every 30s
+var LIGHTNING_WINDOW = 1800;     // seconds of strikes to show (30 min, tiles carry up to retention)
+var LIGHTNING_FADE_WINDOW = 1200; // fade window in seconds (20 min, newest = opaque)
+var LIGHTNING_PAINT_MS = 30000;  // paint + filter refresh cadence
 var lightningOn = false;
-var lightningTimer = null;
-var lightningIconsReady = false;
+var lightningPaintTimer = null;
+var lightningCycleTs = null;     // currently loaded cycle timestamp
+var lightningIconReady = false;
+var lightningAttribution = '';
 
-// Draw a cross-hair of `color` into an ImageData for map.addImage().
-// Matches the leaflet viewer: hot amber core fresh, cooling as it ages.
-function makeCrosshairIcon(color) {
-    var px = 2;                 // retina pixelRatio
+// SDF crosshair — one white icon, color driven by paint so no layer churn.
+function makeCrosshairSdf() {
+    var px = 2;
     var s = 14, c = s / 2, gap = 2;
     var cv = document.createElement('canvas');
     cv.width = s * px; cv.height = s * px;
     var ctx = cv.getContext('2d');
     ctx.scale(px, px);
-    ctx.strokeStyle = color; ctx.lineWidth = 1.5; ctx.lineCap = 'round';
+    ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5; ctx.lineCap = 'round';
     ctx.beginPath();
     ctx.moveTo(c, 0);       ctx.lineTo(c, c - gap);
     ctx.moveTo(c, c + gap); ctx.lineTo(c, s);
     ctx.moveTo(0, c);       ctx.lineTo(c - gap, c);
     ctx.moveTo(c + gap, c); ctx.lineTo(s, c);
     ctx.stroke();
-    ctx.fillStyle = color;
+    ctx.fillStyle = '#ffffff';
     ctx.beginPath(); ctx.arc(c, c, 1, 0, 2 * Math.PI); ctx.fill();
     return ctx.getImageData(0, 0, s * px, s * px);
 }
 
-function ensureLightningIcons() {
-    if (lightningIconsReady) return;
-    var icons = { 'lightning-hot': '#fff15a', 'lightning-mid': '#ffb347', 'lightning-cool': '#ff7b54' };
-    Object.keys(icons).forEach(function(id) {
-        if (!map.hasImage(id)) map.addImage(id, makeCrosshairIcon(icons[id]), { pixelRatio: 2 });
-    });
-    lightningIconsReady = true;
+function ensureLightningIcon() {
+    if (lightningIconReady) return;
+    if (!map.hasImage('lightning-cross')) {
+        map.addImage('lightning-cross', makeCrosshairSdf(), { pixelRatio: 2, sdf: true });
+    }
+    lightningIconReady = true;
 }
 
-function ensureLightningLayer() {
-    if (!map.getSource('lightning-src')) {
+function lightningTileUrl(cycleTs) {
+    var k = getKey();
+    var keyParam = k ? '?key=' + encodeURIComponent(k) : '';
+    return getHost() + '/v2/lightning/' + cycleTs + '/{z}/{x}/{y}.mvt' + keyParam;
+}
+
+function lightningPaintProps() {
+    var now = Math.floor(Date.now() / 1000);
+    var oldest = now - LIGHTNING_FADE_WINDOW;
+    var mid1 = now - LIGHTNING_FADE_WINDOW * 2 / 3;
+    var mid2 = now - LIGHTNING_FADE_WINDOW * 1 / 3;
+    return {
+        // Color: hot yellow for newest, amber mid, red-orange for oldest
+        'icon-color': ['step', ['get', 't'],
+            '#ff7b54',  // default: older than mid1
+            mid1, '#ffb347',
+            mid2, '#fff15a'
+        ],
+        // Opacity: fade from 0.1 at window edge to 1.0 at now
+        'icon-opacity': ['interpolate', ['linear'], ['get', 't'],
+            oldest, 0.1,
+            now, 1.0
+        ]
+    };
+}
+
+function ensureLightningLayer(cycleTs) {
+    var tileUrl = lightningTileUrl(cycleTs);
+    var src = map.getSource('lightning-src');
+    if (!src) {
         map.addSource('lightning-src', {
-            type: 'geojson',
-            data: { type: 'FeatureCollection', features: [] }
+            type: 'vector',
+            tiles: [tileUrl],
+            minzoom: 0,
+            maxzoom: 8
         });
+    } else {
+        src.setTiles([tileUrl]);
     }
     if (!map.getLayer('lightning-layer')) {
+        var props = lightningPaintProps();
         map.addLayer({
             id: 'lightning-layer',
             type: 'symbol',
             source: 'lightning-src',
+            'source-layer': 'lightning',
+            filter: ['>=', ['get', 't'], Math.floor(Date.now() / 1000) - LIGHTNING_WINDOW],
             layout: {
-                'icon-image': ['match', ['get', 'bucket'],
-                    0, 'lightning-hot', 1, 'lightning-mid', 'lightning-cool'],
+                'icon-image': 'lightning-cross',
                 'icon-allow-overlap': true,
                 'icon-ignore-placement': true,
                 'icon-size': 1
             },
             paint: {
-                // Fade newest = opaque, oldest (window edge) = ~transparent.
-                'icon-opacity': ['interpolate', ['linear'], ['get', 't'], 0, 1.0, 1, 0.1]
+                'icon-color': props['icon-color'],
+                'icon-opacity': props['icon-opacity']
             }
         });
+    }
+}
+
+function refreshLightningPaint() {
+    if (!lightningOn) return;
+    var layer = map.getLayer('lightning-layer');
+    if (!layer) return;
+    var now = Math.floor(Date.now() / 1000);
+    var props = lightningPaintProps();
+    map.setPaintProperty('lightning-layer', 'icon-color', props['icon-color']);
+    map.setPaintProperty('lightning-layer', 'icon-opacity', props['icon-opacity']);
+    map.setFilter('lightning-layer', ['>=', ['get', 't'], now - LIGHTNING_WINDOW]);
+}
+
+function updateLightningCycle(cycleTs) {
+    if (cycleTs === lightningCycleTs) return;
+    lightningCycleTs = cycleTs;
+    if (!lightningOn) return;
+    var src = map.getSource('lightning-src');
+    if (src) {
+        src.setTiles([lightningTileUrl(cycleTs)]);
     }
 }
 
 function changeLightning() {
     lightningOn = document.getElementById('lightningToggle').value === 'on';
     if (lightningOn) {
-        ensureLightningIcons();
-        ensureLightningLayer();
-        pollLightning();
-        if (lightningTimer) clearInterval(lightningTimer);
-        lightningTimer = setInterval(pollLightning, LIGHTNING_POLL_MS);
-    } else {
-        if (lightningTimer) { clearInterval(lightningTimer); lightningTimer = null; }
-        var src = map.getSource('lightning-src');
-        if (src) src.setData({ type: 'FeatureCollection', features: [] });
-    }
-}
-
-function pollLightning() {
-    if (!lightningOn) return;
-    var b = map.getBounds();
-    var bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
-        .map(function(v) { return v.toFixed(3); }).join(',');
-    var url = withKey(getHost() + '/v2/lightning?since=' + LIGHTNING_WINDOW + '&bbox=' + bbox);
-    var xhr = new XMLHttpRequest();
-    xhr.open('GET', url, true);
-    xhr.onload = function() {
-        if (!lightningOn) return;
-        if (xhr.status === 503) {
-            alert('Lightning layer is disabled on this server.');
-            document.getElementById('lightningToggle').value = 'off';
-            changeLightning();
+        if (lightningCycleTs === null) {
+            // No manifest data yet — will be set when autoRefresh fires
             return;
         }
-        if (xhr.status < 200 || xhr.status >= 300) return;
-        try {
-            var data = JSON.parse(xhr.responseText);
-            drawFlashes(data.flashes || []);
-        } catch (e) { /* ignore malformed poll */ }
-    };
-    xhr.send();
-}
-
-function drawFlashes(flashes) {
-    var src = map.getSource('lightning-src');
-    if (!src) return;
-    // Cap markers so a continental view of an active day stays responsive;
-    // keep the freshest (list is newest-last from the API).
-    var start = Math.max(0, flashes.length - LIGHTNING_MAX);
-    var features = [];
-    for (var i = start; i < flashes.length; i++) {
-        var f = flashes[i];
-        var t = Math.max(0, Math.min(1, f.age / LIGHTNING_WINDOW));
-        var bucket = t < 0.33 ? 0 : (t < 0.66 ? 1 : 2);
-        features.push({
-            type: 'Feature',
-            geometry: { type: 'Point', coordinates: [f.lon, f.lat] },
-            properties: { t: t, bucket: bucket }
-        });
+        ensureLightningIcon();
+        ensureLightningLayer(lightningCycleTs);
+        refreshLightningPaint();
+        if (lightningPaintTimer) clearInterval(lightningPaintTimer);
+        lightningPaintTimer = setInterval(refreshLightningPaint, LIGHTNING_PAINT_MS);
+        // Show attribution
+        var el = document.getElementById('lightning-attribution');
+        if (el && lightningAttribution) {
+            el.textContent = lightningAttribution;
+            el.style.display = 'block';
+        }
+    } else {
+        if (lightningPaintTimer) { clearInterval(lightningPaintTimer); lightningPaintTimer = null; }
+        // Hide attribution
+        var el = document.getElementById('lightning-attribution');
+        if (el) el.style.display = 'none';
+        // Remove layer + source so the tile cache is released
+        if (map.getLayer('lightning-layer')) map.removeLayer('lightning-layer');
+        if (map.getSource('lightning-src')) map.removeSource('lightning-src');
     }
-    src.setData({ type: 'FeatureCollection', features: features });
 }
 
 // === AUTO-REFRESH ===
@@ -1364,6 +1392,26 @@ function startAutoRefresh() {
                     reinitialize();
                     if (wasPlaying) {
                         playStop(); // Resume: preload then animate
+                    }
+                }
+
+                // Update lightning cycle from manifest (independent of radar refresh).
+                var ld = newData.lightning;
+                if (ld && ld.time) {
+                    lightningAttribution = ld.attribution || '';
+                    var prevTs = lightningCycleTs;
+                    lightningCycleTs = ld.time;
+                    if (lightningOn && prevTs === null) {
+                        // First manifest with lightning — now we can add the layer.
+                        ensureLightningIcon();
+                        ensureLightningLayer(lightningCycleTs);
+                        refreshLightningPaint();
+                        if (lightningPaintTimer) clearInterval(lightningPaintTimer);
+                        lightningPaintTimer = setInterval(refreshLightningPaint, LIGHTNING_PAINT_MS);
+                        var atEl = document.getElementById('lightning-attribution');
+                        if (atEl && lightningAttribution) { atEl.textContent = lightningAttribution; atEl.style.display = 'block'; }
+                    } else if (lightningOn) {
+                        updateLightningCycle(ld.time);
                     }
                 }
             }
