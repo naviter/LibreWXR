@@ -1233,9 +1233,11 @@ var lightningIconReady = false;
 var lightningAttribution = '';
 
 // SDF crosshair — one white icon, color driven by paint so no layer churn.
+// Larger canvas (18 px @ pixelRatio 3) gives the SDF enough resolution to
+// scale cleanly up to icon-size 2.4 at z12 without visible pixelation.
 function makeCrosshairSdf() {
-    var px = 2;
-    var s = 14, c = s / 2, gap = 2;
+    var px = 3;
+    var s = 18, c = s / 2, gap = 3;
     var cv = document.createElement('canvas');
     cv.width = s * px; cv.height = s * px;
     var ctx = cv.getContext('2d');
@@ -1248,14 +1250,14 @@ function makeCrosshairSdf() {
     ctx.moveTo(c + gap, c); ctx.lineTo(s, c);
     ctx.stroke();
     ctx.fillStyle = '#ffffff';
-    ctx.beginPath(); ctx.arc(c, c, 1, 0, 2 * Math.PI); ctx.fill();
+    ctx.beginPath(); ctx.arc(c, c, 1.5, 0, 2 * Math.PI); ctx.fill();
     return ctx.getImageData(0, 0, s * px, s * px);
 }
 
 function ensureLightningIcon() {
     if (lightningIconReady) return;
     if (!map.hasImage('lightning-cross')) {
-        map.addImage('lightning-cross', makeCrosshairSdf(), { pixelRatio: 2, sdf: true });
+        map.addImage('lightning-cross', makeCrosshairSdf(), { pixelRatio: 3, sdf: true });
     }
     lightningIconReady = true;
 }
@@ -1311,7 +1313,12 @@ function ensureLightningLayer(cycleTs) {
                 'icon-image': 'lightning-cross',
                 'icon-allow-overlap': true,
                 'icon-ignore-placement': true,
-                'icon-size': 1
+                'icon-size': ['interpolate', ['linear'], ['zoom'],
+                    3, 0.6,
+                    6, 0.8,
+                    9, 1.5,
+                    12, 2.4
+                ]
             },
             paint: {
                 'icon-color': props['icon-color'],

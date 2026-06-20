@@ -509,21 +509,34 @@ var lightningOn = false;
 var lightningLayer = null;        // L.layerGroup in the lightning-pane
 var lightningTimer = null;
 
-function lightningCrosshairIcon(age) {
+function lightningCrosshairIcon(age, zoom) {
     // Fade newest = opaque, oldest (window edge) = ~transparent. Hot
     // amber core for fresh, cooling toward pale as it ages.
     var t = Math.max(0, Math.min(1, age / LIGHTNING_WINDOW));
     var opacity = (1 - t) * 0.9 + 0.1;
     var color = t < 0.33 ? '#fff15a' : (t < 0.66 ? '#ffb347' : '#ff7b54');
-    var s = 14, c = s / 2, gap = 2;
+    // Scale icon size, stroke, and dot with zoom so strikes stay prominent
+    // at high zoom levels where the basemap is densely detailed.
+    var z = zoom || 0;
+    var s, sw, dr, gap;
+    if (z >= 10) {
+        s = 30; sw = 2.5; dr = 2.5; gap = 4;
+    } else if (z >= 8) {
+        s = 22; sw = 2.0; dr = 2.0; gap = 3;
+    } else if (z >= 6) {
+        s = 18; sw = 1.8; dr = 1.5; gap = 3;
+    } else {
+        s = 14; sw = 1.5; dr = 1.0; gap = 2;
+    }
+    var c = s / 2;
     var svg =
         '<svg width="' + s + '" height="' + s + '" viewBox="0 0 ' + s + ' ' + s + '" ' +
         'style="opacity:' + opacity.toFixed(2) + '">' +
-        '<line x1="' + c + '" y1="0" x2="' + c + '" y2="' + (c - gap) + '" stroke="' + color + '" stroke-width="1.5"/>' +
-        '<line x1="' + c + '" y1="' + (c + gap) + '" x2="' + c + '" y2="' + s + '" stroke="' + color + '" stroke-width="1.5"/>' +
-        '<line x1="0" y1="' + c + '" x2="' + (c - gap) + '" y2="' + c + '" stroke="' + color + '" stroke-width="1.5"/>' +
-        '<line x1="' + (c + gap) + '" y1="' + c + '" x2="' + s + '" y2="' + c + '" stroke="' + color + '" stroke-width="1.5"/>' +
-        '<circle cx="' + c + '" cy="' + c + '" r="1" fill="' + color + '"/>' +
+        '<line x1="' + c + '" y1="0" x2="' + c + '" y2="' + (c - gap) + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<line x1="' + c + '" y1="' + (c + gap) + '" x2="' + c + '" y2="' + s + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<line x1="0" y1="' + c + '" x2="' + (c - gap) + '" y2="' + c + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<line x1="' + (c + gap) + '" y1="' + c + '" x2="' + s + '" y2="' + c + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<circle cx="' + c + '" cy="' + c + '" r="' + dr + '" fill="' + color + '"/>' +
         '</svg>';
     return L.divIcon({
         html: svg, className: 'lightning-crosshair',
@@ -589,7 +602,7 @@ function drawFlashes(flashes) {
     for (var i = start; i < flashes.length; i++) {
         var f = flashes[i];
         L.marker([f.lat, f.lon], {
-            icon: lightningCrosshairIcon(f.age),
+            icon: lightningCrosshairIcon(f.age, map.getZoom()),
             pane: 'lightning-pane',
             interactive: false,
             keyboard: false
