@@ -337,7 +337,7 @@
     </select>
     <select id="lightningToggle" onchange="changeLightning()">
         <option value="off">Lightning: Off</option>
-        <option value="on">Lightning: On</option>
+        <option value="on" selected>Lightning: On</option>
     </select>
     <select id="cellsToggle" onchange="changeCells()">
         <option value="">Cells: Off</option>
@@ -1198,6 +1198,7 @@ function loadApiData() {
             if (ld && ld.time) {
                 lightningCycleTs = ld.time;
                 lightningAttribution = ld.attribution || '';
+                if (lightningOn) enableLightning();
             }
         } else {
             document.getElementById('timestampDisplay').textContent = 'API error';
@@ -1242,7 +1243,7 @@ map.on('moveend', function() {
 var LIGHTNING_WINDOW = 1800;     // seconds of strikes to show (30 min, tiles carry up to retention)
 var LIGHTNING_FADE_WINDOW = 1200; // fade window in seconds (20 min, newest = opaque)
 var LIGHTNING_PAINT_MS = 30000;  // paint + filter refresh cadence
-var lightningOn = false;
+var lightningOn = true;      // layer is on by default (rain + lightning deployment)
 var lightningPaintTimer = null;
 var lightningCycleTs = null;     // currently loaded cycle timestamp
 var lightningIconReady = false;
@@ -1365,24 +1366,32 @@ function updateLightningCycle(cycleTs) {
     }
 }
 
+// Stand the layer up for the currently known cycle.  Shared by the
+// toggle and by the initial manifest load — the layer defaults to ON,
+// and the initial load seeds lightningCycleTs without ever reaching
+// the autoRefresh "first manifest" branch, so without this call here
+// the layer would stay invisible until the user toggled it twice.
+function enableLightning() {
+    if (lightningCycleTs === null) {
+        // No manifest data yet — autoRefresh's first-manifest branch takes it.
+        return;
+    }
+    ensureLightningIcon();
+    ensureLightningLayer(lightningCycleTs);
+    refreshLightningPaint();
+    if (lightningPaintTimer) clearInterval(lightningPaintTimer);
+    lightningPaintTimer = setInterval(refreshLightningPaint, LIGHTNING_PAINT_MS);
+    var el = document.getElementById('lightning-attribution');
+    if (el && lightningAttribution) {
+        el.textContent = lightningAttribution;
+        el.style.display = 'block';
+    }
+}
+
 function changeLightning() {
     lightningOn = document.getElementById('lightningToggle').value === 'on';
     if (lightningOn) {
-        if (lightningCycleTs === null) {
-            // No manifest data yet — will be set when autoRefresh fires
-            return;
-        }
-        ensureLightningIcon();
-        ensureLightningLayer(lightningCycleTs);
-        refreshLightningPaint();
-        if (lightningPaintTimer) clearInterval(lightningPaintTimer);
-        lightningPaintTimer = setInterval(refreshLightningPaint, LIGHTNING_PAINT_MS);
-        // Show attribution
-        var el = document.getElementById('lightning-attribution');
-        if (el && lightningAttribution) {
-            el.textContent = lightningAttribution;
-            el.style.display = 'block';
-        }
+        enableLightning();
     } else {
         if (lightningPaintTimer) { clearInterval(lightningPaintTimer); lightningPaintTimer = null; }
         // Hide attribution

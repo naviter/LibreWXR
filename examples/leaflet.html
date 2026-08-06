@@ -350,7 +350,7 @@
     </select>
     <select id="lightningToggle" onchange="changeLightning()">
         <option value="off">Lightning: Off</option>
-        <option value="on">Lightning: On</option>
+        <option value="on" selected>Lightning: On</option>
     </select>
     <select id="cellsToggle" onchange="changeCells()">
         <option value="">Cells: Off</option>
@@ -511,7 +511,7 @@ function getHost() {
 // flash, fading each by age.  Works on top of whatever base layer is up.
 var LIGHTNING_WINDOW = 600;       // seconds of strikes to show (10 min)
 var LIGHTNING_POLL_MS = 20000;    // re-poll cadence
-var lightningOn = false;
+var lightningOn = true;           // layer is on by default (rain + lightning deployment)
 var lightningLayer = null;        // L.layerGroup in the lightning-pane
 var lightningTimer = null;
 
@@ -618,6 +618,10 @@ function drawFlashes(flashes) {
 
 // Refresh strikes for the new viewport when the user pans/zooms.
 map.on('moveend', function () { if (lightningOn) pollLightning(); });
+
+// The layer defaults to on, so stand it up once the map has bounds to
+// query (pollLightning sends the viewport as a bbox).
+if (lightningOn) startLightning();
 
 // === LAYER MODE ===
 function changeLayer() {
