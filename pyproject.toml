@@ -36,6 +36,10 @@ dependencies = [
     # satellite source (NESDIS publishes hourly mosaics as NetCDF-4).
     # PyPI wheels bundle HDF5/NetCDF C libs, so no system packages needed.
     "netCDF4>=1.7",
+    # Synchronous HTTP for the MTG-LI lightning source's EUMETSAT Data
+    # Store (EUMDAC) OAuth + product download path.  Only exercised when
+    # EUMETSAT credentials are configured; GLM uses anonymous S3 via s3fs.
+    "requests>=2.31",
     "lxml>=5.0",
     "shapely>=2.0",
     # GeoTIFF decoder for the DPC Italian radar source (Cloud-Optimized
@@ -50,6 +54,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.25",
     "httpx",
+    "mapbox-vector-tile>=2.0",
 ]
 # Coverage-map authoring deps.  Not needed at runtime — only when
 # regenerating the PNGs under ``docs/coverage-map-*.png`` via

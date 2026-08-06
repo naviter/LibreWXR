@@ -36,7 +36,11 @@ from types import ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from librewxr.sources._base import NWPContribution, SatelliteContribution
+    from librewxr.sources._base import (
+        LightningContribution,
+        NWPContribution,
+        SatelliteContribution,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +78,20 @@ def satellite_source_slug(contribution: "SatelliteContribution") -> str:
     return f"{base}_grid"
 
 
+def lightning_source_slug(contribution: "LightningContribution") -> str:
+    """Return the snapshot / ``/health`` key for a lightning contribution.
+
+    Mirrors ``satellite_source_slug``: honors ``contribution.slug`` when
+    set, otherwise lowercases ``contribution.name``, collapses non-word
+    characters to underscores, and suffixes ``_grid`` (kept for symmetry
+    with the other source families even though lightning carries no grid).
+    """
+    if contribution.slug:
+        return contribution.slug
+    base = _SLUG_NONWORD.sub("_", contribution.name.lower()).strip("_")
+    return f"{base}_grid"
+
+
 def iter_source_packages() -> Iterator[ModuleType]:
     """Yield every importable subpackage under ``librewxr.sources``.
 
@@ -91,8 +109,8 @@ def iter_source_packages() -> Iterator[ModuleType]:
             logger.exception("Failed to import source package %s", module_info.name)
 
 
-def _collect_providers() -> tuple[list, list, list, list]:
-    radar, nwp, sat, nowcast = [], [], [], []
+def _collect_providers() -> tuple[list, list, list, list, list]:
+    radar, nwp, sat, nowcast, lightning = [], [], [], [], []
     for mod in iter_source_packages():
         rp = getattr(mod, "radar_provider", None)
         if callable(rp):
@@ -106,7 +124,10 @@ def _collect_providers() -> tuple[list, list, list, list]:
         ncp = getattr(mod, "nowcast_provider", None)
         if callable(ncp):
             nowcast.append(ncp)
-    return radar, nwp, sat, nowcast
+        lp = getattr(mod, "lightning_provider", None)
+        if callable(lp):
+            lightning.append(lp)
+    return radar, nwp, sat, nowcast, lightning
 
 
 (
@@ -114,6 +135,7 @@ def _collect_providers() -> tuple[list, list, list, list]:
     NWP_PROVIDERS,
     SATELLITE_PROVIDERS,
     NOWCAST_PROVIDERS,
+    LIGHTNING_PROVIDERS,
 ) = _collect_providers()
 
 
@@ -225,6 +247,33 @@ def collect_satellite_contributions(settings, cache_dir) -> list:
         if result is None:
             continue
         # Providers may return a single contribution or a list — normalize.
+        if isinstance(result, list):
+            contributions.extend(c for c in result if c is not None)
+        else:
+            contributions.append(result)
+    contributions.sort(key=lambda c: c.priority)
+    return contributions
+
+
+def collect_lightning_contributions(settings, cache_dir) -> list:
+    """Walk active lightning providers; return contributions sorted by priority.
+
+    Returns ``[]`` when ``settings.lightning_enabled`` is False, short-
+    circuiting every provider call so no S3 / EUMDAC machinery gets stood
+    up.  Mirrors ``collect_satellite_contributions``: a provider may return
+    a single contribution, a list, or ``None`` (disabled / no credentials).
+    """
+    if not getattr(settings, "lightning_enabled", True):
+        return []
+    contributions = []
+    for provider in LIGHTNING_PROVIDERS:
+        try:
+            result = provider(settings, cache_dir)
+        except Exception:
+            logger.exception("Lightning source provider %r raised", provider)
+            continue
+        if result is None:
+            continue
         if isinstance(result, list):
             contributions.extend(c for c in result if c is not None)
         else:

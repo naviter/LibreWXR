@@ -46,9 +46,16 @@ class SatelliteData(BaseModel):
     infrared: list[RadarTimestamp]
 
 
+class LightningData(BaseModel):
+    time: int
+    path: str
+    attribution: str
+
+
 class WeatherMapsResponse(BaseModel):
     version: str
     generated: int
     host: str
     radar: RadarData
     satellite: SatelliteData
+    lightning: LightningData | None = None

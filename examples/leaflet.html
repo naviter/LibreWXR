@@ -348,6 +348,10 @@
         <option value="light">Arrows: Light</option>
         <option value="dark">Arrows: Dark</option>
     </select>
+    <select id="lightningToggle" onchange="changeLightning()">
+        <option value="off">Lightning: Off</option>
+        <option value="on">Lightning: On</option>
+    </select>
     <select id="cellsToggle" onchange="changeCells()">
         <option value="">Cells: Off</option>
         <option value="light">Cells: Light</option>
@@ -454,6 +458,11 @@ map.createPane('satellite-pane');
 map.getPane('satellite-pane').style.zIndex = 350;
 map.createPane('radar-pane');
 map.getPane('radar-pane').style.zIndex = 450;
+// Lightning cross-hairs ride above radar so strikes are never hidden by
+// precip fill.  pointer-events off so the markers don't eat map drags.
+map.createPane('lightning-pane');
+map.getPane('lightning-pane').style.zIndex = 550;
+map.getPane('lightning-pane').style.pointerEvents = 'none';
 
 var baseMaps = {
     dark: L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -495,6 +504,120 @@ function getApiUrl() {
 function getHost() {
     return apiData.host || SOURCES[activeSource];
 }
+
+// === LIGHTNING (cross-hair overlay) ===
+// Independent of the radar/satellite scrubber: a live overlay that polls
+// /v2/lightning for the most recent strikes and draws one cross-hair per
+// flash, fading each by age.  Works on top of whatever base layer is up.
+var LIGHTNING_WINDOW = 600;       // seconds of strikes to show (10 min)
+var LIGHTNING_POLL_MS = 20000;    // re-poll cadence
+var lightningOn = false;
+var lightningLayer = null;        // L.layerGroup in the lightning-pane
+var lightningTimer = null;
+
+function lightningCrosshairIcon(age, zoom) {
+    // Fade newest = opaque, oldest (window edge) = ~transparent. Hot
+    // amber core for fresh, cooling toward pale as it ages.
+    var t = Math.max(0, Math.min(1, age / LIGHTNING_WINDOW));
+    var opacity = (1 - t) * 0.9 + 0.1;
+    var color = t < 0.33 ? '#fff15a' : (t < 0.66 ? '#ffb347' : '#ff7b54');
+    // Scale icon size, stroke, and dot with zoom so strikes stay prominent
+    // at high zoom levels where the basemap is densely detailed.
+    var z = zoom || 0;
+    var s, sw, dr, gap;
+    if (z >= 10) {
+        s = 30; sw = 2.5; dr = 2.5; gap = 4;
+    } else if (z >= 8) {
+        s = 22; sw = 2.0; dr = 2.0; gap = 3;
+    } else if (z >= 6) {
+        s = 18; sw = 1.8; dr = 1.5; gap = 3;
+    } else {
+        s = 14; sw = 1.5; dr = 1.0; gap = 2;
+    }
+    var c = s / 2;
+    var svg =
+        '<svg width="' + s + '" height="' + s + '" viewBox="0 0 ' + s + ' ' + s + '" ' +
+        'style="opacity:' + opacity.toFixed(2) + '">' +
+        '<line x1="' + c + '" y1="0" x2="' + c + '" y2="' + (c - gap) + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<line x1="' + c + '" y1="' + (c + gap) + '" x2="' + c + '" y2="' + s + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<line x1="0" y1="' + c + '" x2="' + (c - gap) + '" y2="' + c + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<line x1="' + (c + gap) + '" y1="' + c + '" x2="' + s + '" y2="' + c + '" stroke="' + color + '" stroke-width="' + sw + '"/>' +
+        '<circle cx="' + c + '" cy="' + c + '" r="' + dr + '" fill="' + color + '"/>' +
+        '</svg>';
+    return L.divIcon({
+        html: svg, className: 'lightning-crosshair',
+        iconSize: [s, s], iconAnchor: [c, c]
+    });
+}
+
+function changeLightning() {
+    lightningOn = document.getElementById('lightningToggle').value === 'on';
+    if (lightningOn) {
+        startLightning();
+    } else {
+        stopLightning();
+    }
+}
+
+function startLightning() {
+    if (!lightningLayer) {
+        lightningLayer = L.layerGroup([], { pane: 'lightning-pane' });
+    }
+    lightningLayer.addTo(map);
+    pollLightning();
+    if (lightningTimer) clearInterval(lightningTimer);
+    lightningTimer = setInterval(pollLightning, LIGHTNING_POLL_MS);
+}
+
+function stopLightning() {
+    if (lightningTimer) { clearInterval(lightningTimer); lightningTimer = null; }
+    if (lightningLayer) { map.removeLayer(lightningLayer); lightningLayer.clearLayers(); }
+}
+
+function pollLightning() {
+    if (!lightningOn) return;
+    var b = map.getBounds();
+    var bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()]
+        .map(function (v) { return v.toFixed(3); }).join(',');
+    var url = getHost() + '/v2/lightning?since=' + LIGHTNING_WINDOW + '&bbox=' + bbox;
+    var xhr = new XMLHttpRequest();
+    xhr.open('GET', url, true);
+    xhr.onload = function () {
+        if (!lightningOn) return;
+        if (xhr.status === 503) {
+            document.getElementById('timestampDisplay').textContent =
+                'Lightning layer disabled on server';
+            return;
+        }
+        if (xhr.status < 200 || xhr.status >= 300) return;
+        try {
+            var data = JSON.parse(xhr.responseText);
+            drawFlashes(data.flashes || []);
+        } catch (e) { /* ignore malformed poll */ }
+    };
+    xhr.send();
+}
+
+function drawFlashes(flashes) {
+    if (!lightningLayer) return;
+    lightningLayer.clearLayers();
+    // Cap markers so a continental view of an active day stays responsive;
+    // keep the freshest (list is newest-last from the API).
+    var MAX = 4000;
+    var start = Math.max(0, flashes.length - MAX);
+    for (var i = start; i < flashes.length; i++) {
+        var f = flashes[i];
+        L.marker([f.lat, f.lon], {
+            icon: lightningCrosshairIcon(f.age, map.getZoom()),
+            pane: 'lightning-pane',
+            interactive: false,
+            keyboard: false
+        }).addTo(lightningLayer);
+    }
+}
+
+// Refresh strikes for the new viewport when the user pans/zooms.
+map.on('moveend', function () { if (lightningOn) pollLightning(); });
 
 // === LAYER MODE ===
 function changeLayer() {

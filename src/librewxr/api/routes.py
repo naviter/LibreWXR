@@ -16,6 +16,7 @@ from librewxr.api.models import (
     AlertsResponse,
     ColorScheme,
     GeoJSONFeature,
+    LightningData,
     RadarData,
     RadarTimestamp,
     SatelliteData,
@@ -34,6 +35,12 @@ from librewxr.tiles.renderer import (
     render_coverage_tile,
 )
 from librewxr.tiles.request_tracker import TileRequestTracker
+from librewxr.tiles.mvt import (
+    LIGHTNING_LAYER,
+    encode_point_tile,
+    merc_y,
+    quantize_point,
+)
 from librewxr.tiles.satellite_renderer import (
     render_gmgsi_composite_tile,
     render_gmgsi_tile,
@@ -60,6 +67,11 @@ precip_mask = None  # PrecipMaskStore | None — set by main.py (multi mode only
 # Routes index by slug so the /health endpoint and tile dispatcher
 # auto-pick up new channels without per-source plumbing.
 satellite_grids: dict[str, object] = {}
+# Lightning networks keyed by slug (glm_grid, mtg_li_grid).  Point data,
+# no grid — the /v2/lightning endpoint merges every network's flashes and
+# the /health endpoint iterates this dict, so adding a network needs no
+# edits here.
+lightning_grids: dict[str, object] = {}
 tile_warmer = None  # TileWarmer | None
 nowcast_store = None  # NowcastStore | None
 storm_cell_store = None  # StormCellStore | None
@@ -173,10 +185,15 @@ async def health():
         for grid in satellite_grids.values()
         if grid is not None
     )
+    lightning_bytes = sum(
+        grid.data_bytes
+        for grid in lightning_grids.values()
+        if grid is not None
+    )
     coord_bytes = coord_cache_bytes()
     tracked_bytes = (
         radar_bytes + tile_cache_bytes + sum(nwp_bytes_by_slug.values())
-        + nowcast_bytes + satellite_bytes + coord_bytes
+        + nowcast_bytes + satellite_bytes + lightning_bytes + coord_bytes
     )
     other_bytes = max(0, rss_bytes - tracked_bytes)
 
@@ -189,6 +206,7 @@ async def health():
     breakdown.update({
         "nowcast_mb": round(nowcast_bytes / (1024 * 1024), 1),
         "satellite_mb": round(satellite_bytes / (1024 * 1024), 1),
+        "lightning_mb": round(lightning_bytes / (1024 * 1024), 1),
         "coord_caches_mb": round(coord_bytes / (1024 * 1024), 1),
         "other_mb": round(other_bytes / (1024 * 1024), 1),
     })
@@ -270,6 +288,22 @@ async def health():
                     ),
                 }
                 for slug, grid in satellite_grids.items()
+            },
+        },
+        "lightning": {
+            "enabled": settings.lightning_enabled,
+            "networks": {
+                slug: {
+                    "loaded": grid is not None and grid.flash_count > 0,
+                    "flashes": grid.flash_count if grid is not None else 0,
+                    "slots": len(grid.timestamps) if grid is not None else 0,
+                    "latest": (
+                        grid.timestamps[-1]
+                        if grid is not None and grid.timestamps
+                        else None
+                    ),
+                }
+                for slug, grid in lightning_grids.items()
             },
         },
         "enabled_regions": enabled_regions or [],
@@ -357,14 +391,207 @@ async def weather_maps() -> WeatherMapsResponse:
         for sid, name in SCHEME_NAMES.items()
     ]
 
+    lightning_data: LightningData | None = None
+    if settings.lightning_enabled and lightning_grids:
+        slots: list[int] = []
+        networks: list[str] = []
+        for grid in lightning_grids.values():
+            if grid is None:
+                continue
+            networks.append(getattr(grid, "name", "lightning"))
+            slots.extend(grid.timestamps)
+        if slots:
+            latest_ts = max(slots)
+            attribution = "Lightning: " + ", ".join(sorted(set(networks)))
+            if any("MTG-LI" in n for n in networks):
+                attribution += " © EUMETSAT"
+            if any("GLM" in n for n in networks):
+                attribution += " — data: NOAA/NESDIS"
+            lightning_data = LightningData(
+                time=latest_ts,
+                path=f"/v2/lightning/{latest_ts}",
+                attribution=attribution,
+            )
+
     return WeatherMapsResponse(
         version="2.0",
         generated=int(time.time()),
         host=host,
         radar=RadarData(past=past, nowcast=nowcast, colorSchemes=color_schemes),
         satellite=SatelliteData(infrared=infrared),
+        lightning=lightning_data,
     )
 
+
+@router.get("/v2/lightning")
+async def lightning(
+    since: int = Query(default=600, ge=1, le=7200),
+    bbox: str = Query(default=""),
+) -> Response:
+    """Recent lightning flashes as points, merged across every network.
+
+    Each flash is a cross-hair on the frontend, faded by age.  Returns
+    ``{generated, since, count, attribution, flashes: [{t, lat, lon,
+    energy, age}]}`` where ``age`` is seconds since the strike (the
+    frontend's fade input) and ``t`` is the strike's unix time.
+
+    Query params:
+      ``since``  look-back window in seconds (default 600 = 10 min).
+      ``bbox``   optional ``min_lon,min_lat,max_lon,max_lat`` viewport
+                 filter — clip server-side so a zoomed-in client doesn't
+                 ship the whole disk's flashes.
+
+    503 when the lightning layer is disabled, mirroring the satellite
+    tile path's behaviour.
+    """
+    if not settings.lightning_enabled or not lightning_grids:
+        raise HTTPException(status_code=503, detail="Lightning layer disabled")
+
+    parsed_bbox: tuple[float, float, float, float] | None = None
+    if bbox:
+        try:
+            parts = [float(v) for v in bbox.split(",")]
+            if len(parts) != 4:
+                raise ValueError
+            parsed_bbox = (parts[0], parts[1], parts[2], parts[3])
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="bbox must be 'min_lon,min_lat,max_lon,max_lat'",
+            )
+
+    now = int(time.time())
+    flashes: list[dict] = []
+    networks: list[str] = []
+    for grid in lightning_grids.values():
+        if grid is None:
+            continue
+        networks.append(getattr(grid, "name", "lightning"))
+        for ts, lat, lon, energy in grid.flashes_since(since, parsed_bbox):
+            flashes.append({
+                "t": ts,
+                "lat": round(lat, 4),
+                "lon": round(lon, 4),
+                "energy": energy,
+                "age": max(0, now - ts),
+            })
+
+    # Newest last so the frontend can draw older cross-hairs first and let
+    # fresh strikes paint on top.
+    flashes.sort(key=lambda f: f["t"])
+
+    # NOAA GLM is CC0 (attribution requested); EUMETSAT MTG-LI requires it.
+    attribution = "Lightning: " + ", ".join(sorted(set(networks)))
+    if any("MTG-LI" in n for n in networks):
+        attribution += " © EUMETSAT"
+    if any("GLM" in n for n in networks):
+        attribution += " — data: NOAA/NESDIS"
+
+    import json
+    body = json.dumps({
+        "generated": now,
+        "since": since,
+        "count": len(flashes),
+        "attribution": attribution,
+        "flashes": flashes,
+    })
+    return Response(
+        content=body,
+        media_type="application/json",
+        headers={"Cache-Control": "public, max-age=15"},
+    )
+
+
+_MVT_CONTENT_TYPE = "application/vnd.mapbox-vector-tile"
+_MVT_BUFFER = 64  # MVT pixels of buffer outside tile extent
+_MVT_MAX_ZOOM = 8
+_MVT_MAX_FEATURES = 8192
+
+
+@router.get("/v2/lightning/{cycle_ts}/{z}/{x}/{y}.mvt")
+async def lightning_mvt_tile(
+    cycle_ts: int,
+    z: int = Path(ge=0, le=_MVT_MAX_ZOOM),
+    x: int = Path(ge=0),
+    y: int = Path(ge=0),
+) -> Response:
+    """Lightning strikes as a Mapbox Vector Tile, keyed by fetch-cycle timestamp.
+
+    ``cycle_ts`` must be a valid fetch-interval-aligned timestamp within the
+    retention window — anything else returns 404 so nginx doesn't cache
+    garbage keys.  Empty ocean tiles return 200 + empty body (not 204 —
+    nginx doesn't cache 204).
+
+    Cache-Control: newest cycle gets max-age=60 (still receiving late
+    granules); older cycles get max-age=3600 (immutable).
+    """
+    if not settings.lightning_enabled or not lightning_grids:
+        raise HTTPException(status_code=503, detail="Lightning layer disabled")
+
+    now = int(time.time())
+    interval = max(settings.fetch_interval, 1)
+    retention = settings.lightning_retention_minutes * 60
+
+    # Reject misaligned or out-of-window timestamps to cap cache-key surface.
+    if cycle_ts % interval != 0:
+        raise HTTPException(status_code=404, detail="cycle_ts not aligned to fetch interval")
+    if not (now - retention - interval <= cycle_ts <= now + interval):
+        raise HTTPException(status_code=404, detail="cycle_ts outside retention window")
+
+    from librewxr.tiles.coordinates import tile_bounds
+
+    west, south, east, north = tile_bounds(z, x, y)
+    north_merc = merc_y(north)
+    south_merc = merc_y(south)
+
+    # Expand the query bbox by the buffer so edge flashes appear in adjacent tiles.
+    extent = 4096
+    buf_frac = _MVT_BUFFER / extent
+    lon_span = east - west
+    merc_span = north_merc - south_merc
+    query_bbox = (
+        west - lon_span * buf_frac,
+        south - (north - south) * buf_frac,  # approximate lat expansion for query
+        east + lon_span * buf_frac,
+        north + (north - south) * buf_frac,
+    )
+
+    # Collect flashes up to cycle_ts + one interval (newest published slot).
+    query_seconds = retention
+    raw_flashes: list = []
+    for grid in lightning_grids.values():
+        if grid is None:
+            continue
+        for flash in grid.flashes_since(query_seconds, query_bbox):
+            ts, lat, lon, _ = flash
+            if ts <= cycle_ts + interval:
+                raw_flashes.append((ts, lat, lon))
+
+    points: list[tuple[int, int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    # Sort newest-first then dedupe by pixel coord (keep newest).
+    raw_flashes.sort(key=lambda f: -f[0])
+    for ts, lat, lon in raw_flashes:
+        px, py = quantize_point(lat, lon, west, east, north_merc, south_merc, extent)
+        coord = (px, py)
+        if coord not in seen:
+            seen.add(coord)
+            points.append((px, py, ts))
+
+    # Cap and sort so byte-identical tiles come from identical store states.
+    points = points[:_MVT_MAX_FEATURES]
+    points.sort(key=lambda p: (p[2], p[0], p[1]))
+
+    tile_bytes = encode_point_tile(LIGHTNING_LAYER, points, extent)
+
+    # Newest cycle still receiving late granules → short TTL; older = immutable.
+    newest_slot = (now // interval) * interval
+    max_age = 60 if cycle_ts >= newest_slot else 3600
+    headers = {
+        "Cache-Control": f"public, max-age={max_age}",
+        "Content-Type": _MVT_CONTENT_TYPE,
+    }
+    return Response(content=tile_bytes, media_type=_MVT_CONTENT_TYPE, headers=headers)
 
 async def _latest_timestamps_cached() -> list[int]:
     """Latest radar timestamps with a 5 s TTL.

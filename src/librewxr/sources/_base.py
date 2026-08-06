@@ -112,6 +112,41 @@ class SatelliteSource(Protocol):
     async def close(self) -> None: ...
 
 
+@runtime_checkable
+class LightningSource(Protocol):
+    """Shape every lightning source class must satisfy.
+
+    A lightning source ingests individual *flashes* (point strikes with
+    a lat/lon/energy/time) from a geostationary optical lightning mapper
+    — NOAA GOES-GLM over the Americas, EUMETSAT MTG-LI over Europe /
+    Africa / South America — and keeps a rolling window of the most
+    recent flashes in memory.  Unlike radar / NWP / satellite sources it
+    publishes *no grid*: the API serves the raw flash points as JSON and
+    the frontend renders a cross-hair per strike with age-based fade.
+
+    ``fetch`` ergonomics mirror SatelliteSource: it takes no required
+    args, runs its own network I/O in a thread, and returns ``True`` when
+    at least one new flash was ingested (so the fetcher can fire the
+    cross-worker snapshot hook).  ``timestamps`` exposes the distinct
+    fetch-interval slots that currently hold flashes — purely for the
+    ``/health`` payload and catalog; the live query path is
+    ``flashes_since``.
+    """
+
+    name: str
+    timestamps: list[int]
+
+    async def fetch(self) -> bool: ...
+
+    def flashes_since(
+        self,
+        seconds: int,
+        bbox: tuple[float, float, float, float] | None = None,
+    ) -> list[tuple[int, float, float, float]]: ...
+
+    async def close(self) -> None: ...
+
+
 @dataclass
 class RadarSourceContribution:
     """Return value from a source package's ``radar_provider(settings)``.
@@ -221,6 +256,29 @@ class SatelliteContribution:
     """
 
     instance: SatelliteSource
+    priority: int
+    name: str
+    slug: str | None = None
+
+
+@dataclass
+class LightningContribution:
+    """Return value from a source package's ``lightning_provider(settings, cache_dir)``.
+
+    One contribution per network (GLM, MTG-LI).  A provider that needs
+    credentials it doesn't have (MTG-LI with no EUMETSAT key) returns
+    ``None`` so the source stays dormant — same opt-out convention as
+    every other provider.
+
+    ``priority`` is the merge order when two networks overlap (GLM and
+    MTG-LI both see South America): lower wins for a flash both report,
+    though in practice the API concatenates all networks' flashes and the
+    frontend dedup is visual (two cross-hairs a few km apart read as one
+    cell).  ``slug`` overrides the auto-generated ``/health`` key,
+    mirroring SatelliteContribution.
+    """
+
+    instance: LightningSource
     priority: int
     name: str
     slug: str | None = None

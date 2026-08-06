@@ -12,7 +12,8 @@ from pathlib import Path
 import cv2
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from rich.logging import RichHandler
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -38,10 +39,12 @@ from librewxr.data.nwp_source import NWPChain
 from librewxr.data.precip_mask import PrecipMaskStore
 from librewxr.data.store import FrameStore
 from librewxr.sources import (
+    collect_lightning_contributions,
     collect_nowcast_contributions,
     collect_nwp_contributions,
     collect_radar_coverage_metadata,
     collect_satellite_contributions,
+    lightning_source_slug,
     nwp_grid_slug,
     satellite_source_slug,
 )
@@ -84,6 +87,9 @@ _LOG_TAGS = {
     "librewxr.tiles.cache": "tiles",
     "librewxr.tiles.renderer": "tiles",
     "librewxr.tiles.satellite_renderer": "tiles",
+    "librewxr.sources.lightning.glm.source": "glm",
+    "librewxr.sources.lightning.mtg_li.source": "mtg-li",
+    "librewxr.sources.lightning._common": "lightning",
     "librewxr.tiles.coordinates": "tiles",
     "librewxr.data.alerts_fetcher": "alerts",
     "librewxr.data.alerts_store": "alerts",
@@ -341,6 +347,10 @@ async def _render_only_lifespan(app: FastAPI):
     satellite_grids_by_slug: dict[str, object] = {
         satellite_source_slug(c): c.instance for c in satellite_contribs
     }
+    lightning_contribs = collect_lightning_contributions(settings, cache_dir)
+    lightning_grids_by_slug: dict[str, object] = {
+        lightning_source_slug(c): c.instance for c in lightning_contribs
+    }
     nowcast_store = (
         NowcastStore(cache_dir=cache_dir)
         if (settings.nowcast_enabled or settings.arrow_flow_enabled)
@@ -362,6 +372,7 @@ async def _render_only_lifespan(app: FastAPI):
         "frame_store": store,
         **nwp_grids_by_slug,
         **satellite_grids_by_slug,
+        **lightning_grids_by_slug,
         "nowcast_store": nowcast_store,
         "storm_cell_store": storm_cell_store,
         "alerts_store": alerts_store,
@@ -396,6 +407,11 @@ async def _render_only_lifespan(app: FastAPI):
     satellite_grids_by_slug = {
         slug: stores[slug]
         for slug in satellite_grids_by_slug
+        if stores[slug] is not None
+    }
+    lightning_grids_by_slug = {
+        slug: stores[slug]
+        for slug in lightning_grids_by_slug
         if stores[slug] is not None
     }
     ecmwf_grid = nwp_grids_by_slug.get("ecmwf_grid")
@@ -479,6 +495,7 @@ async def _render_only_lifespan(app: FastAPI):
     routes.ecmwf_grid = ecmwf_grid
     routes.nwp_chain = nwp_chain
     routes.satellite_grids = satellite_grids_by_slug
+    routes.lightning_grids = lightning_grids_by_slug
     routes.tile_warmer = None
     routes.nowcast_store = nowcast_store
     routes.storm_cell_store = storm_cell_store
@@ -654,6 +671,15 @@ async def lifespan(app: FastAPI):
             "Satellite chain: [%s]",
             ", ".join(c.name for c in satellite_contribs),
         )
+    lightning_contribs = collect_lightning_contributions(settings, nwp_cache_dir)
+    lightning_grids_by_slug: dict[str, object] = {
+        lightning_source_slug(c): c.instance for c in lightning_contribs
+    }
+    if lightning_contribs:
+        logger.info(
+            "Lightning chain: [%s]",
+            ", ".join(c.name for c in lightning_contribs),
+        )
     enabled = settings.get_enabled_regions()
 
     # Precompute radar station coverage masks used by the ECMWF fallback
@@ -820,6 +846,7 @@ async def lifespan(app: FastAPI):
     routes.ecmwf_grid = ecmwf_grid
     routes.nwp_chain = nwp_chain
     routes.satellite_grids = satellite_grids_by_slug
+    routes.lightning_grids = lightning_grids_by_slug
     routes.tile_warmer = warmer
     routes.nowcast_store = nowcast_store
     routes.storm_cell_store = storm_cell_store
@@ -876,6 +903,7 @@ async def lifespan(app: FastAPI):
         store, cache,
         nwp_contributions=nwp_contribs,
         satellite_contributions=satellite_contribs,
+        lightning_contributions=lightning_contribs,
         nowcast_generator=nowcast_generator,
         storm_cell_generator=storm_cell_generator,
         warmer=warmer,
@@ -984,6 +1012,17 @@ if mcp_app is not None:
     # librewxr/mcp/server.py.  Update this list when a new tool is added.
     routes.mcp_tools = ["get_precip_nowcast", "get_active_alerts", "get_storm_cells"]
     logger.info("MCP HTTP transport mounted at %s", settings.mcp_path)
+
+_examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "examples")
+if os.path.isdir(_examples_dir):
+    app.mount("/examples", StaticFiles(directory=_examples_dir), name="examples")
+
+@app.get("/", include_in_schema=False)
+async def root(request: Request):
+    # Preserve the query string (e.g. ?key=...) so the viewer can read it.
+    query = request.url.query
+    target = "/examples/maplibre.html" + (f"?{query}" if query else "")
+    return RedirectResponse(url=target)
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):

@@ -28,7 +28,11 @@ from librewxr.sources.regional.north_america.usa.radar.mrms import (
 )
 from librewxr.data.store import FrameStore, RadarFrame
 from librewxr.sources import collect_radar_contributions
-from librewxr.sources._base import NWPContribution, SatelliteContribution
+from librewxr.sources._base import (
+    LightningContribution,
+    NWPContribution,
+    SatelliteContribution,
+)
 from librewxr.tiles.cache import TileCache
 
 logger = logging.getLogger(__name__)
@@ -66,6 +70,7 @@ class RadarFetcher:
         cache: TileCache,
         nwp_contributions: list[NWPContribution] | None = None,
         satellite_contributions: list[SatelliteContribution] | None = None,
+        lightning_contributions: list[LightningContribution] | None = None,
         nowcast_generator=None,
         storm_cell_generator=None,
         warmer=None,
@@ -91,6 +96,13 @@ class RadarFetcher:
         self._satellite_contributions: list[SatelliteContribution] = list(
             satellite_contributions or []
         )
+        # Lightning sources (GLM, MTG-LI) fetch the same detached-background
+        # way as satellite: each is point-data over a high-latency endpoint
+        # and must never gate the radar cycle.  Adding a network needs zero
+        # edits here.
+        self._lightning_contributions: list[LightningContribution] = list(
+            lightning_contributions or []
+        )
         self._nowcast_generator = nowcast_generator
         self._storm_cell_generator = storm_cell_generator
         self._warmer = warmer
@@ -105,6 +117,7 @@ class RadarFetcher:
         self._closed = False
         self._task: asyncio.Task | None = None
         self._satellite_tasks: dict[str, asyncio.Task] = {}
+        self._lightning_tasks: dict[str, asyncio.Task] = {}
         self._enabled_regions = [
             REGIONS[name] for name in settings.get_enabled_regions()
         ]
@@ -230,6 +243,11 @@ class RadarFetcher:
             except Exception:
                 logger.exception("Error closing %s", contrib.name)
         for contrib in self._satellite_contributions:
+            try:
+                await contrib.instance.close()
+            except Exception:
+                logger.exception("Error closing %s", contrib.name)
+        for contrib in self._lightning_contributions:
             try:
                 await contrib.instance.close()
             except Exception:
@@ -521,6 +539,43 @@ class RadarFetcher:
             self._satellite_tasks[slug] = asyncio.create_task(
                 self._fetch_satellite_background(contrib),
             )
+
+        # Lightning networks: same detached-per-source pattern.  GLM pulls
+        # a handful of small NetCDF granules per fetch over anonymous S3;
+        # MTG-LI (when credentialed) goes through the EUMETSAT Data Store.
+        # Neither must gate the radar cycle, so each runs as its own task.
+        from librewxr.sources import lightning_source_slug
+
+        for contrib in self._lightning_contributions:
+            slug = lightning_source_slug(contrib)
+            existing = self._lightning_tasks.get(slug)
+            if existing is not None and not existing.done():
+                logger.debug("%s fetch still running, skipping", contrib.name)
+                continue
+            self._lightning_tasks[slug] = asyncio.create_task(
+                self._fetch_lightning_background(contrib),
+            )
+
+    async def _fetch_lightning_background(
+        self, contrib: LightningContribution,
+    ) -> None:
+        """Fetch one lightning network detached from the main cycle.
+
+        Mirrors ``_fetch_satellite_background``: fire the cycle-complete
+        hook on success so render-only workers pick up new flashes
+        mid-cycle; warn-and-drop on failure (next cycle retries).
+        """
+        try:
+            new_flashes = await contrib.instance.fetch()
+        except Exception:
+            logger.warning(
+                "%s fetch failed, lightning layer may be stale", contrib.name,
+            )
+            release_memory()
+            return
+        release_memory()
+        if new_flashes:
+            await self._fire_cycle_complete()
 
     async def _fetch_satellite_background(
         self, contrib: SatelliteContribution,
