@@ -280,7 +280,7 @@ class JMAMSMGrid:
             self._memmap_dir = Path(tempfile.mkdtemp(prefix="librewxr_jma_msm_"))
             self._persistent = False
         self._memmap_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(
+        logger.debug(
             "JMA MSM memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
         )
@@ -332,7 +332,7 @@ class JMAMSMGrid:
                 self._latest_run_ts = run_ts
             loaded += 1
         if loaded:
-            logger.info("JMA MSM: loaded %d cached frame(s) from disk", loaded)
+            logger.debug("JMA MSM: loaded %d cached frame(s) from disk", loaded)
 
         snow_pat = re.compile(r"^r(\d+)_l(\d+)_snow$")
         snow_loaded = 0
@@ -359,7 +359,7 @@ class JMAMSMGrid:
             self._snow_masks[(run_ts, lead_s)] = mm
             snow_loaded += 1
         if snow_loaded:
-            logger.info(
+            logger.debug(
                 "JMA MSM: loaded %d cached snow mask(s) from disk",
                 snow_loaded,
             )
@@ -587,7 +587,7 @@ class JMAMSMGrid:
             self._evict_outside_window(window_start, window_end)
 
             if total_fetched:
-                logger.info(
+                logger.debug(
                     "JMA MSM: %d hourly frame(s) ingested + %d interpolated "
                     "across %d run(s); store now holds %d frame(s)",
                     total_fetched, total_interpolated,
@@ -743,7 +743,7 @@ class JMAMSMGrid:
         self._fs = None
         if not self._persistent:
             shutil.rmtree(self._memmap_dir, ignore_errors=True)
-            logger.info("JMA MSM memmap directory cleaned up")
+            logger.debug("JMA MSM memmap directory cleaned up")
         else:
             logger.info(
                 "JMA MSM cache retained at %s for warm restart",

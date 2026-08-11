@@ -2,6 +2,9 @@
 # Copyright (C) 2026 Joshua Kimsey
 """Tests for precipitation nowcasting: store, generator, and optical flow."""
 import asyncio
+import os
+import re
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -104,6 +107,117 @@ class TestNowcastStore:
         store.clear()
         timestamps = await store.get_timestamps()
         assert timestamps == []
+
+
+class TestNowcastStoreTmpIsolation:
+    """Cross-process tmp-file isolation on the shared (multi-mode) nowcast dir.
+
+    In multi mode the pipeline writes ``nowcast/*.dat`` files that render
+    workers memmap read-only via state.json.  Two writers (overlapping
+    pipeline processes during a deploy) can race on the same final name,
+    and a render-worker boot must never sweep the pipeline's in-flight
+    tmp files.  These tests pin both halves of the fix: unique (pid+uuid)
+    tmp names in ``_to_memmap``, and ``cleanup_tmp=False`` for readers.
+    """
+
+    def test_to_memmap_tmp_names_are_unique(self, tmp_path, monkeypatch):
+        """Two writes to the same final name must never share a tmp file.
+
+        The tmp name embeds pid + uuid (mirroring ``coord_store.publish``),
+        so concurrent writers can't collide on the same ``.tmp`` path and
+        steal each other's in-flight file.  The pre-fix deterministic
+        ``<name>.dat.tmp`` produced identical paths; this test must fail
+        against that code.
+        """
+        store = NowcastStore(cache_dir=tmp_path)
+        replaced_srcs: list[str] = []
+
+        real_replace = os.replace
+
+        def _capture_replace(src, dst):
+            replaced_srcs.append(str(src))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(
+            "librewxr.data.nowcast.os.replace", _capture_replace,
+        )
+        data = np.zeros((4, 4), dtype=np.uint8)
+        store._to_memmap("frame_1000_USCOMP", data)
+        store._to_memmap("frame_1000_USCOMP", data)
+
+        assert len(replaced_srcs) == 2
+        # pid + uuid naming (mirrors coord_store.publish), distinct per
+        # write.  The old ``frame_1000_USCOMP.dat.tmp`` fails the regex
+        # AND produces two identical paths.
+        pattern = re.compile(r"^frame_1000_USCOMP\.dat\.\d+\.[0-9a-f]{32}\.tmp$")
+        assert all(
+            pattern.match(Path(name).name) for name in replaced_srcs
+        )
+        assert replaced_srcs[0] != replaced_srcs[1]
+
+    def test_concurrent_writer_does_not_steal_tmp(self, tmp_path, monkeypatch):
+        """Deterministic cross-process race: store B completes its full
+        write for the same name while store A's ``_to_memmap`` is in flight.
+
+        With unique tmp names A's ``os.replace`` still succeeds (B never
+        touched A's tmp path) and the final ``.dat`` holds valid content.
+        Under the pre-fix deterministic ``<name>.dat.tmp``, B's rename
+        removes the file A is about to rename and A raises
+        ``FileNotFoundError``.
+        """
+        name = "frame_1234567890_USCOMP"
+        data_a = np.full((4, 4), 7, dtype=np.uint8)
+        data_b = np.full((4, 4), 9, dtype=np.uint8)
+
+        store_a = NowcastStore(cache_dir=tmp_path)
+        store_b = NowcastStore(cache_dir=tmp_path)
+
+        real_replace = os.replace
+        b_completed = False
+
+        def _coordinated_replace(src, dst):
+            nonlocal b_completed
+            if not b_completed:
+                # B runs its whole write (tmp -> final) before A's rename.
+                b_completed = True
+                store_b._to_memmap(name, data_b)
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(
+            "librewxr.data.nowcast.os.replace", _coordinated_replace,
+        )
+
+        result = store_a._to_memmap(name, data_a)  # must not raise
+
+        final = tmp_path / "nowcast" / f"{name}.dat"
+        assert final.exists()
+        np.testing.assert_array_equal(result, data_a)
+        np.testing.assert_array_equal(
+            np.memmap(final, dtype=np.uint8, mode="r", shape=data_a.shape),
+            data_a,
+        )
+
+    def test_reader_store_boot_preserves_inflight_tmp(self, tmp_path):
+        """A reader (render-worker) boot must not delete the pipeline's
+        in-flight ``*.tmp`` file in the shared nowcast dir.
+
+        ``cleanup_tmp=False`` (the render-only lifespan) leaves it alone;
+        the default ``True`` (the pipeline's own boot) still sweeps stale
+        leftovers.  Pins both sides of the contract.
+        """
+        nowcast_dir = tmp_path / "nowcast"
+        nowcast_dir.mkdir(parents=True, exist_ok=True)
+        inflight = nowcast_dir / "something.dat.tmp"
+        inflight.write_bytes(b"\x00" * 16)
+
+        # Reader boot: sweep must NOT run.
+        NowcastStore(cache_dir=tmp_path, cleanup_tmp=False)
+        assert inflight.exists()
+
+        # Writer (pipeline) boot: default sweep removes stale tmp files.
+        inflight.write_bytes(b"\x00" * 16)
+        NowcastStore(cache_dir=tmp_path)
+        assert not inflight.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -985,8 +1099,17 @@ class TestNowcastStoreNWPFlow:
     @pytest.mark.asyncio
     async def test_nwp_flow_absent_in_old_snapshot(self, tmp_path):
         """Old snapshots written before the hybrid arrow path omit
-        ``nwp_flow``; ``__setstate__`` must treat absence as ``None``."""
+        ``nwp_flow``; ``__setstate__`` must treat absence as ``None``.
+        The producer holds a frame so ``__getstate__`` returns a dict
+        (an all-empty store now serializes to ``None``)."""
         producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.8,
+                regions={"A": np.ones((4, 4), dtype=np.uint8)},
+            ),
+        ])
         state = producer.__getstate__()
         # Simulate an old snapshot by removing the key entirely.
         del state["nwp_flow"]
@@ -994,3 +1117,267 @@ class TestNowcastStoreNWPFlow:
         consumer = NowcastStore()
         consumer.__setstate__(state)
         assert await consumer.get_nwp_flow() is None
+
+
+class TestNowcastStoreEmptyState:
+    """Empty-store dump/apply semantics.
+
+    The pipeline boots with an empty NowcastStore, and the first
+    ``state.json`` dump can fire before the first generation completes.
+    An all-empty dump must never wholesale-replace a populated store on
+    a serving render worker — ``__getstate__`` returns ``None`` for an
+    all-empty store (``dump_state`` then skips the entry) and
+    ``__setstate__`` refuses an all-empty payload while holding content.
+    """
+
+    @pytest.mark.asyncio
+    async def test_getstate_none_while_empty(self, tmp_path):
+        """A fresh, all-empty store serializes to ``None`` so the first
+        boot dump can't null render workers; once one frame lands the
+        store serializes normally."""
+        store = NowcastStore(cache_dir=tmp_path)
+        assert store.__getstate__() is None
+
+        await store.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.8,
+                regions={"A": np.ones((4, 4), dtype=np.uint8)},
+            ),
+        ])
+        state = store.__getstate__()
+        assert state is not None
+        assert [int(f["timestamp"]) for f in state["frames"]] == [1000]
+
+    @pytest.mark.asyncio
+    async def test_getstate_present_with_flows_only(self, tmp_path):
+        """A store with flows but no frames is a valid, dumpable state
+        (arrow-flow-only configuration) — ``__getstate__`` must not
+        collapse it to ``None``."""
+        store = NowcastStore(cache_dir=tmp_path)
+        await store.replace_flows({"R1": np.zeros((4, 6, 2), dtype=np.float32)})
+        state = store.__getstate__()
+        assert state is not None
+        assert state["frames"] == []
+        assert "R1" in state["flows"]
+
+    @pytest.mark.asyncio
+    async def test_setstate_empty_payload_keeps_existing_frames(self, tmp_path):
+        """An all-empty payload carries no information (historically
+        "first generation in flight") — it must not null a store that is
+        currently serving frames and flows."""
+        store = NowcastStore(cache_dir=tmp_path)
+        frame = NowcastFrame(
+            timestamp=1000,
+            blend_weight=0.7,
+            regions={"A": np.zeros((4, 4), dtype=np.uint8)},
+        )
+        await store.replace_all([frame])
+        flow = np.zeros((4, 4, 2), dtype=np.float32)
+        await store.replace_flows({"A": flow})
+
+        store.__setstate__({
+            "memmap_dir": str(store._memmap_dir),
+            "frames": [],
+            "flows": {},
+            "nwp_flow": None,
+        })
+
+        assert await store.get_timestamps() == [1000]
+        nc_frame, weight = await store.get_frame(1000)
+        assert nc_frame is not None
+        assert weight == pytest.approx(0.7)
+        np.testing.assert_array_equal(
+            nc_frame.regions["A"], np.zeros((4, 4), dtype=np.uint8),
+        )
+        flows = await store.get_flows()
+        assert "A" in flows
+        np.testing.assert_array_equal(flows["A"], flow)
+
+    @pytest.mark.asyncio
+    async def test_setstate_empty_payload_on_empty_store_is_noop(self, tmp_path):
+        """An all-empty payload applied to an already-empty store is a
+        no-op — it applies without error and the store stays empty."""
+        store = NowcastStore(cache_dir=tmp_path)
+        store.__setstate__({
+            "memmap_dir": str(store._memmap_dir),
+            "frames": [],
+            "flows": {},
+            "nwp_flow": None,
+        })
+        assert await store.get_timestamps() == []
+        assert await store.get_flows() == {}
+        assert await store.get_nwp_flow() is None
+
+    @pytest.mark.asyncio
+    async def test_setstate_frames_empty_but_flows_present_applies(self, tmp_path):
+        """A payload with frames=[] but a non-empty flows dict is the
+        arrow-only path — it must apply normally (replace flows, leave
+        frames empty), not be treated as an all-empty dump."""
+        store = NowcastStore(cache_dir=tmp_path)
+        # Give the store existing content so the apply-side guard is live.
+        await store.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.7,
+                regions={"A": np.zeros((4, 4), dtype=np.uint8)},
+            ),
+        ])
+        flow = np.full((4, 4, 2), 2.5, dtype=np.float32)
+        await store.replace_flows({"A": flow})
+        arr = store._flows["A"]
+
+        store.__setstate__({
+            "memmap_dir": str(store._memmap_dir),
+            "frames": [],
+            "flows": {
+                "A": [
+                    os.path.basename(str(arr.filename)),
+                    arr.dtype.str,
+                    list(arr.shape),
+                ],
+            },
+            "nwp_flow": None,
+        })
+
+        assert await store.get_timestamps() == []
+        flows = await store.get_flows()
+        assert list(flows) == ["A"]
+        np.testing.assert_array_equal(flows["A"], flow)
+
+
+class TestNowcastStoreSetstateStaleFiles:
+    """``__setstate__`` must tolerate memmap files the pipeline has since
+    deleted (dump/generation ordering window): the affected frames / flows
+    are skipped instead of failing the whole store.  Mirrors the
+    PrecipMaskStore stale-file handling.
+    """
+
+    @pytest.mark.asyncio
+    async def test_setstate_skips_frame_whose_region_file_is_missing(self, tmp_path):
+        """A frame with any missing region file is skipped wholesale (a
+        partial frame would render misleading partial tiles); frames with
+        intact files still apply."""
+        producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.8,
+                regions={"A": np.ones((4, 4), dtype=np.uint8)},
+            ),
+            NowcastFrame(
+                timestamp=2000,
+                blend_weight=0.5,
+                regions={"B": np.ones((4, 4), dtype=np.uint8)},
+            ),
+        ])
+        state = producer.__getstate__()
+        import json
+        snapshot = json.loads(json.dumps(state))
+        # Delete the file backing frame 1000's region "A".
+        memmap_dir = Path(snapshot["memmap_dir"])
+        frame_info = next(
+            f for f in snapshot["frames"] if int(f["timestamp"]) == 1000
+        )
+        (memmap_dir / frame_info["regions"]["A"][0]).unlink()
+
+        consumer = NowcastStore()
+        consumer.__setstate__(snapshot)
+        # Frame 1000 skipped wholesale; frame 2000 still applied.
+        assert await consumer.get_timestamps() == [2000]
+        frame, weight = await consumer.get_frame(2000)
+        assert frame is not None
+        assert weight == pytest.approx(0.5)
+        np.testing.assert_array_equal(
+            frame.regions["B"], np.ones((4, 4), dtype=np.uint8),
+        )
+
+    @pytest.mark.asyncio
+    async def test_setstate_skips_only_missing_flow_entry(self, tmp_path):
+        """A missing flow file skips just that region's flow; peer flows
+        still apply (arrows for the missing region suppress until the next
+        cycle)."""
+        producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_flows({
+            "A": np.zeros((4, 4, 2), dtype=np.float32),
+            "B": np.ones((4, 4, 2), dtype=np.float32),
+        })
+        state = producer.__getstate__()
+        import json
+        snapshot = json.loads(json.dumps(state))
+        memmap_dir = Path(snapshot["memmap_dir"])
+        (memmap_dir / snapshot["flows"]["A"][0]).unlink()
+
+        consumer = NowcastStore()
+        consumer.__setstate__(snapshot)
+        flows = await consumer.get_flows()
+        assert "A" not in flows
+        assert "B" in flows
+        np.testing.assert_array_equal(
+            flows["B"], np.ones((4, 4, 2), dtype=np.float32),
+        )
+
+    @pytest.mark.asyncio
+    async def test_setstate_missing_nwp_flow_file_becomes_none(self, tmp_path):
+        """A missing ``nwp_flow`` file is treated as ``None`` — the arrow
+        overlay outside radar coverage simply doesn't render until the
+        next cycle."""
+        producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_nwp_flow(np.full((4, 8, 2), 2.0, dtype=np.float32))
+        state = producer.__getstate__()
+        import json
+        snapshot = json.loads(json.dumps(state))
+        memmap_dir = Path(snapshot["memmap_dir"])
+        (memmap_dir / snapshot["nwp_flow"][0]).unlink()
+
+        consumer = NowcastStore()
+        consumer.__setstate__(snapshot)
+        assert await consumer.get_nwp_flow() is None
+
+    @pytest.mark.asyncio
+    async def test_setstate_other_region_errors_still_propagate(self, tmp_path):
+        """Genuine corruption (anything but FileNotFoundError) must still
+        propagate so ``apply_state`` logs it — no silent degradation."""
+        producer = NowcastStore(cache_dir=tmp_path)
+        await producer.replace_all([
+            NowcastFrame(
+                timestamp=1000,
+                blend_weight=0.8,
+                regions={"A": np.ones((4, 4), dtype=np.uint8)},
+            ),
+        ])
+        state = producer.__getstate__()
+        import json
+        snapshot = json.loads(json.dumps(state))
+        frame_info = next(
+            f for f in snapshot["frames"] if int(f["timestamp"]) == 1000
+        )
+        # Corrupt the shape so np.memmap raises ValueError (a memmap
+        # larger than the backing file), not FileNotFoundError.
+        frame_info["regions"]["A"][2] = [999, 999]
+
+        consumer = NowcastStore()
+        with pytest.raises(ValueError):
+            consumer.__setstate__(snapshot)
+
+    def test_init_cleanup_tmp_opt_out_preserves_tmp_files(self, tmp_path):
+        """``cleanup_tmp=False`` leaves ``*.tmp`` files in the (shared,
+        multi-mode) memmap dir untouched — a render worker resurrecting the
+        store mid-run must not unlink a ``.dat.tmp`` the pipeline is
+        concurrently writing.  The default ``True`` still sweeps leftovers.
+        """
+        nowcast_dir = tmp_path / "nowcast"
+        nowcast_dir.mkdir(parents=True, exist_ok=True)
+
+        # Default: the constructor sweeps leftover *.tmp files.
+        leftover = nowcast_dir / "frame_1000_A.dat.tmp"
+        leftover.write_bytes(b"\x00" * 16)
+        NowcastStore(cache_dir=tmp_path)
+        assert not leftover.exists()
+
+        # Opt-out: leftover *.tmp files are left untouched.
+        leftover.write_bytes(b"\x00" * 16)
+        store = NowcastStore(cache_dir=tmp_path, cleanup_tmp=False)
+        assert leftover.exists()
+        # The store still operates normally on the shared dir.
+        assert store._memmap_dir == nowcast_dir

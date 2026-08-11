@@ -91,6 +91,20 @@ Allowed CORS origins for cross-origin requests from web browsers.
 
 If you restrict this, make sure your web app's origin is included or tile requests from browsers will fail silently.
 
+### `LIBREWXR_LOG_LEVEL`
+
+Root log level for the Rich-tagged console output (the `[tag] message` format shared with uvicorn's own loggers).  One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` — case-insensitive, normalized to uppercase.  At the default `INFO`, boot status, fetch-cycle timing, and per-source fetch durations are visible while per-cycle noise (memmap-directory lines, per-source ingest summaries, fetch-cycle-start banners, retry attempts) stays at `DEBUG`.
+
+| | |
+|---|---|
+| **Default** | `INFO` |
+| **Type** | string |
+
+**Example:**
+```bash
+LIBREWXR_LOG_LEVEL=DEBUG
+```
+
 ---
 
 ## Radar Data
@@ -372,13 +386,16 @@ WebP encoding quality for tiles requested in `.webp` format. Does not affect PNG
 
 | | |
 |---|---|
-| **Default** | `65` |
+| **Default** | `100` |
 | **Type** | integer |
 | **Range** | 1 - 100 |
 
-- `100` = lossless (best quality, larger files)
-- `65` = lossy (visually identical for radar imagery, ~4-6x smaller than PNG)
-- `1-64` = increasingly lossy
+- `100` = lossless (default; best quality, larger files)
+- `1-99` = lossy at that quality (e.g. `65` is roughly 4x smaller than lossless but visibly softens saturated radar colors)
+
+The lossless path uses libwebp's fast `method=1` preset: sizes stay within ~1% of max-effort lossless while encoding is 1.5-4x faster.
+
+PNG tiles are encoded adaptively and losslessly: when a tile's final pixels contain at most 256 unique RGBA colors (typical for unsmoothed radar tiles), the encoder builds an exact 8-bit palette from those colors and writes a palette (P-mode) PNG with a `tRNS` chunk carrying full 8-bit alpha; otherwise it writes a plain 32-bit RGBA PNG. No configuration knob is needed — the encoder selects the smaller representation automatically, and both paths reproduce the input pixels bit-for-bit.
 
 ### `LIBREWXR_TILE_CACHE_MB`
 
@@ -405,6 +422,29 @@ These caches are the largest RAM consumer after frame data. Reducing this saves 
 | **Default** | `2048` (single) / `512` (multi) — set 0 or unset to use the mode default |
 | **Type** | integer |
 
+### `LIBREWXR_COORD_STORE_ENABLED`
+
+Master switch for the shared on-disk coordinate store (`data/coord_store.py`). When enabled, the six cached tile-coordinate functions in `tiles/coordinates.py` publish their computed arrays to a shared store under `LIBREWXR_CACHE_DIR` and read them back as read-only memmaps, so multi-worker deployments compute each array once globally instead of once per render worker. When `false`, the per-worker in-process coordinate LRU caches are used exactly as before the store existed.
+
+Best-effort: any store failure (unwritable cache dir, corrupt files, version mismatch) is logged once and falls back to the in-process compute path — the store is never a single point of failure. Requires `LIBREWXR_CACHE_DIR`; the store disables itself when the cache dir is unset.
+
+| | |
+|---|---|
+| **Default** | `true` |
+| **Type** | boolean |
+
+### `LIBREWXR_COORD_STORE_MB`
+
+Size cap of the shared on-disk coordinate store, in megabytes. The cap is **soft**: the store is pruned once per fetch cycle by whichever process owns store maintenance (the pipeline in multi mode, the main process in single mode — via the ~30 s-debounced cycle hook), so it can briefly overshoot between prunes.
+
+The default tracks `LIBREWXR_MODE`: 1024 in single mode, 8192 in multi mode. In multi mode the budget is **shared by ALL render workers** — every worker reads the same on-disk store, so the 8192 MB default covers the combined warm set rather than 8192 MB per worker. Settable via `.env` like any knob; a restart applies the change. Requires `LIBREWXR_CACHE_DIR`; the store disables itself when the cache dir is unset.
+
+| | |
+|---|---|
+| **Default** | `1024` (single) / `8192` (multi) — set 0 or unset to use the mode default |
+| **Type** | integer |
+| **Unit** | megabytes |
+
 ### `LIBREWXR_WARMER_THREADS`
 
 Thread pool size for background tile cache warming, **single mode only** — in multi mode no `TileWarmer` is instantiated in render workers, and the 4-thread multi default sizes the request-executor pool used to compute tile geometry, not a warming pool. When a tile is requested, the warmer pre-computes the geometry for that same tile position at all other timestamps in the background, so animation playback is smooth without waiting for each frame to render on demand. Warming covers all color schemes and output formats automatically because the cache stores pre-presentation geometry, not encoded bytes.
@@ -418,14 +458,22 @@ The empty-tile fast path (see `tile_requests.fast_path` in `/health`) and per-wo
 
 ### `LIBREWXR_WARM_COORD_ZOOM`
 
-Pre-warm coordinate caches up to this zoom level at startup. Coordinate caches store tile-to-region pixel index mappings; warming them eliminates cold-start latency from trigonometric projections. In multi mode, this runs only in the pipeline parent process; serving workers build their coordinate caches lazily on first request.
+Pre-warm coordinate caches up to this zoom level at startup, as a **background task**: the server starts accepting requests immediately and the warm proceeds alongside serving, so a slow warm on cold storage (ZFS/HDD) never blocks boot. Coordinate caches store tile-to-region pixel index mappings; warming them eliminates cold-start latency from trigonometric projections. Coordinate wrappers handle unwarmed entries gracefully — they compute on demand and publish to the shared on-disk coord store — so lazy loading is always safe.
 
 | | |
 |---|---|
-| **Default** | `6` |
+| **Default** | `0` (mode default: `6` in single / no eager warm in multi) |
 | **Type** | integer |
 
-Each zoom level adds ~4x the tiles of the previous (zoom 6 = ~5,500 tiles). Set to `0` to disable.
+Resolution:
+
+- `0` (or unset) — use the per-mode default: **single** warms up to zoom 6 in the background; **multi** render workers do no eager warm at all, building their coordinate caches lazily on first request.
+- Negative (e.g. `-1`) — disable the warm entirely in either mode.
+- Positive — force that zoom in either mode (e.g. `4` in multi re-enables a background warm; `-1` in single turns the warm off).
+
+Each zoom level adds ~4x the tiles of the previous (zoom 6 = ~5,500 tiles).
+
+> **Note:** this changes the meaning of `0` relative to earlier releases — `0` previously meant "disabled"; it now means "use the mode default". Use a negative value to disable.
 
 ### `LIBREWXR_WARM_OVERVIEW_ZOOM`
 
@@ -502,6 +550,18 @@ Seconds between memory pressure checks.
 | **Default** | `30` |
 | **Type** | integer |
 | **Unit** | seconds |
+
+### `LIBREWXR_SHARED_TILE_STORE_MB`
+
+Budget, in megabytes, of the shared on-disk store of **encoded** tile bytes under `LIBREWXR_CACHE_DIR` (`tiles_shared/`). Multi-mode render workers publish their freshly-encoded plain past-frame tiles here and read back bytes published by any other worker — one encode serves the whole fleet — instead of each worker redundantly colorizing and encoding the same viewport. The store is disabled in single mode (one process — the in-memory cache is enough).
+
+Semantics: unset (`None`) = auto, which resolves to **2048 MB for render-only workers** and **disabled in single mode**; `0` or any negative value disables the store entirely; a positive value sets the MB budget explicitly. Content-versioned keys (the frame's content version is folded into each key) make stale entries unreachable between fetch cycles, and the render workers' state poller invalidates + prunes the store with the same cadence as the in-memory tile cache. Requires `LIBREWXR_CACHE_DIR` (a shared volume) — render-only mode already requires it.
+
+| | |
+|---|---|
+| **Default** | unset (auto: `2048` in multi / disabled in single) |
+| **Type** | integer (or unset) |
+| **Unit** | megabytes |
 
 ### Docker memory limits
 
@@ -1183,9 +1243,7 @@ Number of hourly satellite frames retained per channel. GMGSI publishes one fram
 
 ## Weather Alerts (WMO CAP)
 
-Fetches global weather alerts from severeweather.wmo.int. MeteoAlarm geocodes are downloaded on first startup and cached locally. Updates are clock-aligned (:00, :05, :10, …).
-
-For US locations, point lookups also query the NWS point endpoint at api.weather.gov to surface non-polygon alerts (e.g. Tornado Watches) that lack geometry in the global feed.
+Fetches global weather alerts from severeweather.wmo.int. MeteoAlarm geocodes are downloaded on first startup and cached locally. Updates are clock-aligned (:00, :05, :10, …). US alerts come directly from the NWS API; zone-based alerts (e.g. Tornado Watches) are resolved to zone polygons at ingest, with zone geometries disk-cached for 30 days — no per-request NWS queries are needed.
 
 ### `LIBREWXR_ALERTS_ENABLED`
 

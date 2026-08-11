@@ -17,11 +17,14 @@ load) so they work regardless of which lifespan set the singletons up.
 import logging
 
 from fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import Response
 
 from librewxr.config import settings
 from librewxr.api import routes
 from librewxr.api.models import AlertsResponse
 from librewxr.mcp import tools
+from librewxr.mcp.discovery import package_version, server_card_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +70,11 @@ def _register_tools(mcp: FastMCP) -> None:
     ) -> dict:
         """Get active weather alerts within a radius of a geographic point.
 
-        Returns a GeoJSON FeatureCollection of WMO CAP alerts, enriched
-        with US NWS point alerts for US locations.  Filter by severity.
-        Returns an empty FeatureCollection when alerts are disabled or
-        no alerts match; never raises.
+        Returns a GeoJSON FeatureCollection of alerts from the merged
+        WMO + NWS store; US zone-based alerts (e.g. Tornado Watches) are
+        resolved to zone polygons at ingest.  Filter by severity.  Returns
+        an empty FeatureCollection when alerts are disabled or no alerts
+        match; never raises.
 
         Args:
             lat: Query latitude in degrees (-90 to 90).
@@ -130,9 +134,26 @@ def build_mcp_http_app():
     final URL ``/mcp`` -- NOT ``/mcp/mcp``.  See the FastMCP Lifespans
     doc pattern (``mcp.http_app(path="/")`` + ``app.mount("/mcp", ...)``).
     """
-    mcp = FastMCP("librewxr-mcp")
+    # Stateless HTTP: every request is self-contained (a fresh transport
+    # per request, no in-memory session store).  Multi-mode runs N render
+    # workers behind one origin (e.g. a cloudflared tunnel); with
+    # per-process in-memory sessions the client's next request lands on a
+    # different worker and fails with ``-32600 Session not found``.
+    # LibreWXR tools are pure reads and need no per-session state, so
+    # stateless is spec-blessed and safe.
+    mcp = FastMCP("librewxr-mcp", version=package_version())
     _register_tools(mcp)
-    return mcp.http_app(path="/")
+    # SEP-2127 (draft) MCP server card.  Registered on the FastMCP
+    # instance (not the parent app) so it rides the ``mcp_path`` mount
+    # prefix automatically: the sub-app serves it at ``/server-card``
+    # and the parent ``app.mount(settings.mcp_path, mcp_app)`` puts the
+    # final URL at ``<mcp_path>/server-card`` (e.g. ``/mcp/server-card``).
+    @mcp.custom_route("/server-card", methods=["GET"], include_in_schema=False)
+    async def _server_card(request: Request) -> Response:
+        """Serve the discovery server card at ``<mcp_path>/server-card``."""
+        return await server_card_endpoint(request)
+
+    return mcp.http_app(path="/", stateless_http=True)
 
 
 def main() -> None:
@@ -149,7 +170,11 @@ def main() -> None:
             "it's the shared directory the data pipeline (or single-mode "
             "server) writes state.json into."
         )
-    mcp = FastMCP("librewxr-mcp", lifespan=build_stdio_lifespan)
+    mcp = FastMCP(
+        "librewxr-mcp",
+        lifespan=build_stdio_lifespan,
+        version=package_version(),
+    )
     _register_tools(mcp)
     logger.info("Starting librewxr-mcp stdio transport")
     mcp.run(transport="stdio")

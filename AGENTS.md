@@ -119,6 +119,7 @@ Docker Compose uses profiles: `COMPOSE_PROFILES=single` or `COMPOSE_PROFILES=mul
 - **Memory:** Heavily uses numpy memmap (temp files) for radar frames, ECMWF grids, and nowcast data. Memory monitor is cgroup-aware for multi-worker. See docker-compose.yml for RAM guidance.
 - **Tile warming (single mode):** Two separate thread pools — one for on-demand requests, one for background tile warming — so requests never queue behind warming tasks. Warmer pre-computes geometry only. This is single-mode-only; in multi mode the fetcher and renderers are separate processes and no TileWarmer is instantiated — the empty-tile fast path and per-worker LRU caches cover the cold-render case instead.
 - **Weather alerts:** WMO CAP alerts via `alerts_fetcher.py` (async HTTP) + `alerts_store.py`. In multi mode, pipeline owns fetching; render workers read via `state.json` snapshot.
+- **Worker pulses:** Every render process writes a small JSON pulse to `<cache_dir>/workers/worker_<pid>.json` every ~15s (jittered, atomic tmp+os.replace; see `src/librewxr/data/worker_pulse.py`); `/health` aggregates fresh pulses (mtime-filtered, lock-free) into an additive top-level `cluster` section - workers_reporting, container cgroup anon/file/shmem split, summed per-worker RSS / tile-cache / coord-cache / request counters with hit ratios recomputed from sums. The pulse loop runs in both lifespans (single + render-only), gated on `cache_dir`; not in the pipeline.
 
 ## Configuration
 
@@ -172,6 +173,9 @@ All config via `LIBREWXR_*` env vars or `.env` file. Settings defined in `src/li
 - `LIBREWXR_CACHE_DIR`: persistent disk cache; empty = in-memory only
 - `LIBREWXR_NWP_FETCH_CONCURRENCY`: max parallel NWP grid decodes (default 4)
 - `LIBREWXR_TILE_TRACKING_ENABLED`: hot-tile counters surfaced in `/health` diagnostics (default true; adaptive warming policy not currently shipping)
+- `LIBREWXR_COORD_STORE_ENABLED`: shared on-disk coordinate store (default true; false reverts to per-worker in-process caches; requires `LIBREWXR_CACHE_DIR`)
+- `LIBREWXR_COORD_STORE_MB`: shared coord-store size cap (0 = mode default: 1024 single / 8192 multi; soft cap, pruned once per fetch cycle; multi budget shared by all render workers)
+- `LIBREWXR_LOG_LEVEL`: root log level (DEBUG/INFO/WARNING/ERROR/CRITICAL, default INFO; case-insensitive; per-cycle noise logs at DEBUG)
 
 ## Adding a New Source
 
@@ -190,4 +194,4 @@ The discovery walker picks up the new package automatically — no per-source pl
 - **File headers:** `# SPDX-License-Identifier: AGPL-3.0-or-later` + `# Copyright (C) 2026 Joshua Kimsey` on every source file
 - **Commit style:** imperative mood, concise (e.g., "Add precipitation motion arrows")
 - **Docker:** `docker compose up --build` with `COMPOSE_PROFILES=single` (default) or `COMPOSE_PROFILES=multi`. Exposes port 8080 (configurable via `LIBREWXR_PORT`). Use `docker compose run --rm clear-cache` to wipe caches.
-- **Docs:** `docs/adding-a-source.md`, `docs/configuration-reference.md`, `docs/satellite-implementation-plan.md`, `docs/coverage.md`, `docs/rainviewer-migration-guide.md`, `docs/web-integration-guide.md`, `docs/source-survey.md`
+- **Docs:** `docs/adding-a-source.md`, `docs/configuration-reference.md`, `docs/satellite-implementation-plan.md`, `docs/coverage.md`, `docs/rainviewer-migration-guide.md`, `docs/web-integration-guide.md`, `docs/source-survey.md`, `docs/self-host-sizing.md`

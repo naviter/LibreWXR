@@ -14,6 +14,7 @@ from librewxr.config import settings
 from librewxr.data.coverage import sample_coverage, sample_feather
 from librewxr.data.regions import RegionDef
 from librewxr.tiles.coordinates import (
+    compute_blur_radius,
     overlapping_regions,
     region_pixel_indices,
     region_pixel_indices_fractional,
@@ -23,6 +24,7 @@ from librewxr.tiles.coordinates import (
     tile_pixel_latlons,
     tile_pixel_latlons_padded,
 )
+from librewxr.tiles.png_palette import encode_png
 
 if TYPE_CHECKING:
     from librewxr.data.precip_mask import PrecipMaskStore
@@ -149,7 +151,7 @@ def compute_tile_geometry(
     # Uses the highest-priority (finest) region's Jacobian so that mixed
     # coarse + fine tiles size their blur to the resolution that's
     # actually visible at the center.
-    blur_radius = _compute_blur_radius(
+    blur_radius = compute_blur_radius(
         regions_with_data[0], z, x, y, tile_size,
     ) if smooth else 0.0
 
@@ -187,16 +189,20 @@ def compute_tile_geometry(
 
     # Fill uncovered pixels from NWP precipitation data.  For nowcast
     # frames, blend extrapolated radar with NWP using temporal weight +
-    # spatial feathering at coverage boundaries.
+    # spatial feathering at coverage boundaries.  Only regions that
+    # actually delivered a frame this cycle take part: a region that is
+    # down or empty would otherwise still contribute its coverage mask
+    # (blocking NWP fill, leaving a hole) and its feather (suppressing
+    # the model over its footprint) (issue #24).
     if has_nwp:
         if nowcast_blend is not None:
             values = _blend_nowcast(
-                values, regions, z, x, y, tile_size, pad, nwp_chain,
+                values, regions_with_data, z, x, y, tile_size, pad, nwp_chain,
                 frame_timestamp, smooth, nowcast_blend,
             )
         else:
             values = _fill_ecmwf_fallback(
-                values, regions, z, x, y, tile_size, pad, nwp_chain,
+                values, regions_with_data, z, x, y, tile_size, pad, nwp_chain,
                 frame_timestamp, smooth,
             )
 
@@ -445,36 +451,6 @@ def render_tile(
 # ---------------------------------------------------------------------------
 
 
-def _compute_blur_radius(
-    region: RegionDef, z: int, x: int, y: int, tile_size: int
-) -> float:
-    """Pick a Gaussian blur radius matched to the visible region pixel size.
-
-    Reads the local Jacobian of ``region_pixel_indices_fractional`` at the
-    tile centre to find how many tile pixels a single region pixel covers
-    (``tile_per_region``).  Blur radius scales as a quarter of that span,
-    which is the σ that rounds a single region-pixel "block" at its
-    edges without merging it with its neighbours (the visible Gaussian
-    width is ~3σ, so a quarter-block σ touches half a block on each side).
-    At low zoom the ratio is < 1 and the radius collapses to
-    ``smooth_radius`` (baseline); at high zoom on a very coarse source
-    growth is capped at ``tile_size / 32`` to keep the kernel from
-    smearing unrelated cells together.
-    """
-    base = settings.smooth_radius
-    if base <= 0:
-        return 0.0
-    row_f, col_f = region_pixel_indices_fractional(region, z, x, y, tile_size)
-    cy = cx = tile_size // 2
-    drow = abs(float(row_f[cy + 1, cx] - row_f[cy - 1, cx])) / 2.0
-    dcol = abs(float(col_f[cy, cx + 1] - col_f[cy, cx - 1])) / 2.0
-    if drow < 1e-6 or dcol < 1e-6:
-        return base
-    tile_per_region = max(1.0 / drow, 1.0 / dcol)
-    raw = base * max(1.0, tile_per_region * 0.25)
-    return min(raw, tile_size / 32.0)
-
-
 def _gather_clipped(
     frame_data: np.ndarray, row_idx: np.ndarray, col_idx: np.ndarray
 ) -> np.ndarray:
@@ -638,7 +614,7 @@ def render_coverage_tile(
 
 def _fill_ecmwf_fallback(
     values: np.ndarray,
-    regions: list[RegionDef],
+    regions_with_data: list[RegionDef],
     z: int, x: int, y: int,
     tile_size: int, pad: int,
     nwp_chain,
@@ -661,11 +637,12 @@ def _fill_ecmwf_fallback(
     else:
         lat_grid, lon_grid = tile_pixel_latlons(z, x, y, tile_size)
 
-    # Union coverage from every region that overlaps this tile — even
-    # regions we don't have a frame for yet, because if a station reaches
-    # this tile we still don't want NWP overlapping with radar.
+    # Union coverage from every region that delivered a frame this
+    # cycle.  Regions without a frame are excluded by the caller so a
+    # down or empty region's coverage mask can't block the NWP fill
+    # and leave a hole (issue #24).
     covered = np.zeros(lat_grid.shape, dtype=bool)
-    for region in regions:
+    for region in regions_with_data:
         covered |= sample_coverage(region.name, lat_grid, lon_grid)
 
     uncovered = (values == 0) & ~covered
@@ -683,7 +660,7 @@ def _fill_ecmwf_fallback(
 
 def _blend_nowcast(
     radar_values: np.ndarray,
-    regions: list[RegionDef],
+    regions_with_data: list[RegionDef],
     z: int, x: int, y: int,
     tile_size: int, pad: int,
     nwp_chain,
@@ -727,7 +704,7 @@ def _blend_nowcast(
 
     # Build the spatial feather weight: union across all overlapping regions
     feather = np.zeros(lat_grid.shape, dtype=np.float32)
-    for region in regions:
+    for region in regions_with_data:
         feather = np.maximum(feather, sample_feather(region.name, lat_grid, lon_grid))
 
     # Per-pixel effective radar weight
@@ -1196,14 +1173,16 @@ def _transparent_tile(tile_size: int, fmt: str) -> bytes:
 
 def _encode_image(img: Image.Image, fmt: str) -> bytes:
     """Encode a PIL image to bytes."""
-    buf = io.BytesIO()
     if fmt == "webp":
+        buf = io.BytesIO()
         q = settings.webp_quality
         if q >= 100:
-            img.save(buf, format="WEBP", lossless=True)
+            # Fast lossless preset; measured ~1% size cost for 1.5-4x faster
+            # encode vs the default method 4.
+            img.save(buf, format="WEBP", lossless=True, method=1)
         else:
             img.save(buf, format="WEBP", quality=q)
-    else:
-        # PNG is lossless at any compression level; 1 is the fastest.
-        img.save(buf, format="PNG", optimize=False, compress_level=1)
-    return buf.getvalue()
+        return buf.getvalue()
+    # PNG: adaptive lossless — exact 8-bit palette when the tile has few
+    # enough unique colors, otherwise plain 32-bit RGBA (see png_palette).
+    return encode_png(img)

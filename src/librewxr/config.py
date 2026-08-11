@@ -17,13 +17,21 @@ _MODE_DEFAULTS: dict[str, dict[str, int]] = {
         "workers": 1,
         "tile_cache_mb": 200,
         "coord_cache_size": 2048,
+        "coord_store_mb": 1024,
         "warmer_threads": 0,  # 0 keeps the "auto = CPU-1" behaviour in single mode
+        "warm_coord_zoom": 6,
     },
     "multi": {
         "workers": 16,
         "tile_cache_mb": 128,
         "coord_cache_size": 512,
+        "coord_store_mb": 8192,
         "warmer_threads": 4,
+        # No eager coordinate warm in render workers: they serve immediately
+        # from the on-disk state snapshot and coordinate entries load lazily
+        # through the shared coord store.  A negative value here is the
+        # "disabled" resolution (see warm_coord_zoom below).
+        "warm_coord_zoom": -1,
     },
 }
 
@@ -50,6 +58,9 @@ class Settings(BaseSettings):
     fetch_interval: int = 600  # seconds between fetches (10 min = radar frame cadence)
     max_frames: int = 12
     max_zoom: int = 12
+    # Root log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
+    # (case-insensitive; normalized to uppercase by the validator).
+    log_level: str = "INFO"
     # Deployment shape.  Drives sensible defaults for workers, tile cache,
     # coord cache, and warmer threads via ``_apply_mode_defaults``.
     #   single  - one container, fetcher + renderer in the same process
@@ -61,19 +72,45 @@ class Settings(BaseSettings):
         "single",
         validation_alias=AliasChoices("LIBREWXR_MODE", "COMPOSE_PROFILES"),
     )
-    # All four below use 0 as a "use mode default" sentinel.  Set an
+    # All six below use 0 as a "use mode default" sentinel.  Set an
     # explicit value to override the per-mode default in _MODE_DEFAULTS.
     tile_cache_mb: int = 0  # Max tile cache size in MB (byte-capped); 0 = mode default
     coord_cache_size: int = 0  # LRU entries per coordinate cache; 0 = mode default
+    # Shared on-disk coordinate-array store (see data/coord_store.py).  The
+    # six cached tile-coordinate functions in tiles/coordinates.py publish /
+    # read their computed arrays here so multi-worker deployments compute
+    # each array once globally instead of once per worker.  Best-effort: any
+    # store failure falls back to the in-process compute path.
+    coord_store_enabled: bool = True  # Kill switch; False bypasses the store entirely
+    coord_store_mb: int = 0  # Coord-store size cap in MB; 0 = mode default (single 1024, multi 8192)
+    # Shared on-disk encoded-tile store (see tiles/shared_tile_store.py).
+    # Multi-mode only: render workers publish / read encoded tile bytes on
+    # the shared cache volume so one worker's encode serves all workers.
+    # Content-versioned keys (built by the wiring) make stale entries
+    # unreachable between fetch cycles.  Semantics:
+    #   None          - auto: render-only workers default to a 2048 MB
+    #                   budget; single-mode deployments leave the store
+    #                   disabled (the wiring decides).
+    #   0 or negative - disabled.
+    #   positive      - explicit MB budget for the shared encoded-tile
+    #                   store (multi-mode only).
+    shared_tile_store_mb: int | None = None
     memory_limit_mb: int = 0  # Container memory limit in MB (0 = auto-detect)
     memory_pressure_check_interval: int = 30  # Seconds between memory pressure checks
     smooth_radius: float = 1.0  # Baseline Gaussian blur radius; renderer auto-scales it up at high zoom on coarse sources
     noise_floor_dbz: float = 10.0  # Minimum dBZ to display; lower values are zeroed out
     despeckle_min_neighbors: int = 3  # Min non-zero neighbors (of 8) to keep a pixel; 0 to disable
-    webp_quality: int = 65  # WebP quality: 100 = lossless, 1-99 = lossy at that quality
+    webp_quality: int = 100  # WebP quality: 100 = lossless (default), 1-99 = lossy at that quality
     workers: int = 0  # Number of uvicorn worker processes; 0 = mode default
     warmer_threads: int = 0  # Render thread pool size; 0 = mode default (auto in single, 4 in multi) (sizes the request-executor pool in multi mode; the warmer itself is single-mode only)
-    warm_coord_zoom: int = 6  # Pre-warm coordinate caches up to this zoom (0 = disable) (in multi mode runs in each render worker at startup)
+    # Pre-warm coordinate caches up to this zoom as a background task at
+    # startup (0 = mode default: single warms to 6, multi does no eager
+    # warm — see _MODE_DEFAULTS).  Any negative value disables the warm
+    # entirely in either mode; any positive value forces that zoom in
+    # either mode.  The warm never blocks the server from accepting
+    # requests, and coordinate wrappers fill unwarmed entries on demand
+    # via the shared on-disk store either way.
+    warm_coord_zoom: int = 0
     warm_overview_zoom: int = 4  # Pre-render ALL tiles up to this zoom on each fetch (-1 = disable) (single mode only; no-op in multi mode — the empty-tile fast path covers it)
     warm_overview_zoom_regional: int = 6  # Pre-render tiles overlapping enabled regions up to this zoom (-1 = disable) (single mode only; no-op in multi mode — the empty-tile fast path covers it)
     enabled_regions: str = "ALL"  # Region spec: CONUS, US, ALL, or comma-separated region names
@@ -510,6 +547,13 @@ class Settings(BaseSettings):
         if "single" in tokens:
             return "single"
         return "single"
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalize_log_level(cls, v: str) -> str:
+        """Validate + canonicalize LIBREWXR_LOG_LEVEL via the shared helper."""
+        from librewxr.logging_setup import normalize_level
+        return normalize_level(v)
 
     @model_validator(mode="after")
     def _apply_mode_defaults(self):

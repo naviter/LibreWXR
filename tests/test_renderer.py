@@ -11,10 +11,14 @@ pytestmark = pytest.mark.tiles
 
 from librewxr.data.regions import REGIONS
 from librewxr.tiles.cache import TileCache
-from librewxr.tiles.coordinates import COMPOSITE_HEIGHT, COMPOSITE_WIDTH
+from librewxr.tiles.coordinates import (
+    COMPOSITE_HEIGHT,
+    COMPOSITE_WIDTH,
+    compute_blur_radius,
+)
+from librewxr.tiles.png_palette import _PALETTE_MIN_COLORS, encode_png
 from librewxr.tiles.renderer import (
     TileGeometry,
-    _compute_blur_radius,
     _compute_nwp_only_geometry,
     compute_tile_geometry,
     present_tile,
@@ -186,6 +190,135 @@ class TestTileGeometryCache:
         assert cache.get(key) is None
 
 
+class TestAdaptivePalettePng:
+    """Adaptive lossless PNG8 encoding (see tiles/png_palette.py).
+
+    Tiles with ``_PALETTE_MIN_COLORS``..256 unique RGBA colors are encoded
+    as exact-palette P-mode PNGs (lossless, full 8-bit alpha via tRNS);
+    everything else keeps the plain 32-bit RGBA encoding.  These tests
+    prove losslessness (decode -> RGBA equals the input exactly) and the
+    mode selection rules, both on ``encode_png`` directly and through the
+    ``present_tile`` integration path.
+    """
+
+    @staticmethod
+    def _banded_img(colors: int, width: int = 16) -> Image.Image:
+        """One horizontal band per color: exactly ``colors`` unique pixels.
+
+        ``(r, g)`` encodes the band index bijectively (r = i % 256, g =
+        i // 256), so the fixture holds exactly ``colors`` unique colors
+        even above 256.
+        """
+        arr = np.zeros((colors, width, 4), dtype=np.uint8)
+        for i in range(colors):
+            arr[i, :, :] = (
+                i % 256,
+                (i // 256) * 255,
+                (i * 7) % 256,
+                128 + (i * 3) % 128,
+            )
+        return Image.fromarray(arr, "RGBA")
+
+    def test_single_color_stays_rgba(self):
+        """1 unique color always takes the plain RGBA path."""
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        out = Image.open(io.BytesIO(encode_png(img)))
+        assert out.mode == "RGBA"
+        assert np.array_equal(np.asarray(out), np.asarray(img))
+
+    def test_three_colors_with_partial_alpha(self):
+        """3 colors incl. partial alpha -> palette path (threshold 2), and
+        the decode round-trips to the exact input RGBA array."""
+        arr = np.zeros((3, 16, 4), dtype=np.uint8)
+        arr[0, :, :] = (255, 0, 0, 255)
+        arr[1, :, :] = (0, 255, 0, 128)  # partial alpha
+        arr[2, :, :] = (0, 0, 255, 64)   # more partial alpha
+        img = Image.fromarray(arr, "RGBA")
+        data = encode_png(img)
+        out = Image.open(io.BytesIO(data))
+        if _PALETTE_MIN_COLORS <= 3:
+            assert out.mode == "P"
+        else:
+            assert out.mode == "RGBA"
+        assert np.array_equal(np.asarray(out.convert("RGBA")), np.asarray(img))
+
+    def test_forty_colors_round_trips(self):
+        """~40 colors -> palette path, bit-exact round trip."""
+        img = self._banded_img(40)
+        data = encode_png(img)
+        out = Image.open(io.BytesIO(data))
+        assert out.mode == "P"  # 40 is well above any plausible threshold
+        assert np.array_equal(np.asarray(out.convert("RGBA")), np.asarray(img))
+
+    def test_300_colors_stays_rgba(self):
+        """> 256 unique colors keep the plain RGBA path."""
+        img = self._banded_img(300)
+        uniq = len(np.unique(np.asarray(img).reshape(-1, 4), axis=0))
+        assert uniq > 256, "fixture must exceed the 256-color palette cap"
+        out = Image.open(io.BytesIO(encode_png(img)))
+        assert out.mode == "RGBA"
+        assert np.array_equal(np.asarray(out), np.asarray(img))
+
+    def test_no_smooth_tile_encodes_as_palette(self, sample_frame_data, monkeypatch):
+        """A no-smooth radar tile (few unique colors) must decode as mode P
+        and match the lossless-WebP render pixel-for-pixel."""
+        # Pin the shipped default (quality 100 = lossless) so this test does
+        # not depend on ambient LIBREWXR_WEBP_QUALITY / .env values.
+        from librewxr.config import settings
+        monkeypatch.setattr(settings, "webp_quality", 100)
+        regions = {"USCOMP": sample_frame_data}
+        geom = compute_tile_geometry(
+            regions, z=5, x=7, y=12, tile_size=256,
+        )
+        assert not geom.is_transparent
+        assert geom.blur_radius == 0.0  # no smoothing -> palette-friendly
+        png = present_tile(geom, color_scheme=2, fmt="png")
+        png_img = Image.open(io.BytesIO(png))
+        assert png_img.mode == "P"
+        webp = present_tile(geom, color_scheme=2, fmt="webp")
+        webp_img = Image.open(io.BytesIO(webp)).convert("RGBA")
+        assert np.array_equal(
+            np.asarray(png_img.convert("RGBA")), np.asarray(webp_img)
+        )
+
+    def test_smooth_tile_stays_rgba(self, sample_frame_data):
+        """Blurred tiles have too many colors for a palette -> plain RGBA."""
+        regions = {"USCOMP": sample_frame_data}
+        geom = compute_tile_geometry(
+            regions, z=5, x=7, y=12, tile_size=256, smooth=True,
+        )
+        png = present_tile(geom, color_scheme=2, fmt="png")
+        assert Image.open(io.BytesIO(png)).mode == "RGBA"
+
+    def test_png_present_is_deterministic(self, sample_frame_data):
+        """Same geometry + params -> identical PNG bytes."""
+        regions = {"USCOMP": sample_frame_data}
+        geom = compute_tile_geometry(
+            regions, z=5, x=7, y=12, tile_size=256,
+        )
+        first = present_tile(geom, color_scheme=2, fmt="png")
+        second = present_tile(geom, color_scheme=2, fmt="png")
+        assert first == second
+
+    def test_transparent_tile_stays_rgba(self):
+        """Fully transparent tile (1 color) stays on the RGBA path."""
+        geom = TileGeometry.transparent(256)
+        png = present_tile(geom, color_scheme=2, fmt="png")
+        assert Image.open(io.BytesIO(png)).mode == "RGBA"
+
+    def test_transparent_tile_is_compact(self):
+        """A fully transparent 256x256 tile must stay small on any host.
+
+        The RGBA fallback encodes at compress_level=6 (like the palette
+        path) so its size does not depend on the host libz flavor: stock
+        zlib and zlib-ng diverge ~4x at level 1 but converge at level 6
+        (~250-350 B).  600 B is a safe host-independent bound.
+        """
+        geom = TileGeometry.transparent(256)
+        png = present_tile(geom, color_scheme=2, fmt="png")
+        assert len(png) < 600
+
+
 class TestBlurRadius:
     """Blur radius must scale with how many tile pixels a region pixel covers."""
 
@@ -209,7 +342,7 @@ class TestBlurRadius:
         radii = []
         for z in (5, 8, 11):
             x, y = self._lonlat_to_tile(-90.0, 35.0, z)  # Memphis-ish
-            radii.append(_compute_blur_radius(uscomp, z, x, y, 256))
+            radii.append(compute_blur_radius(uscomp, z, x, y, 256))
         assert radii[0] <= radii[1] < radii[2], (
             f"blur should grow monotonically with zoom, got {radii}"
         )
@@ -221,8 +354,8 @@ class TestBlurRadius:
         z = 10
         us_x, us_y = self._lonlat_to_tile(-90.0, 35.0, z)
         eu_x, eu_y = self._lonlat_to_tile(10.0, 50.0, z)
-        us_blur = _compute_blur_radius(uscomp, z, us_x, us_y, 256)
-        eu_blur = _compute_blur_radius(opera, z, eu_x, eu_y, 256)
+        us_blur = compute_blur_radius(uscomp, z, us_x, us_y, 256)
+        eu_blur = compute_blur_radius(opera, z, eu_x, eu_y, 256)
         assert eu_blur > us_blur, (
             f"coarser region should get more blur, USCOMP={us_blur:.2f} OPERA={eu_blur:.2f}"
         )
@@ -232,7 +365,7 @@ class TestBlurRadius:
         opera = REGIONS["OPERA"]
         z = 12
         x, y = self._lonlat_to_tile(10.0, 50.0, z)
-        r = _compute_blur_radius(opera, z, x, y, 256)
+        r = compute_blur_radius(opera, z, x, y, 256)
         assert r <= 256 / 32 + 1e-6, f"blur {r} exceeded safety cap"
 
 
@@ -551,3 +684,100 @@ class TestEmptyTileFastPath:
             assert present_tile(geom_b, color_scheme=2, fmt=fmt) == present_tile(
                 ref, color_scheme=2, fmt=fmt
             )
+
+
+class TestRegionsWithDataGating:
+    """A region that overlaps the tile but delivered no frame this cycle
+    must not contribute coverage or feather (issue #24).
+
+    ``compute_tile_geometry`` builds ``regions_with_data`` (only regions
+    that actually delivered a frame this cycle) and passes it to both
+    ``_fill_ecmwf_fallback`` and ``_blend_nowcast``.  Before the fix the
+    plain all-overlapping ``regions`` list was passed, so a down or empty
+    region still contributed its coverage mask - blocking the NWP
+    fallback fill and leaving a hole in past frames - and its feather -
+    suppressing the model over its footprint in nowcast frames even
+    though no radar data existed there to protect.
+    """
+
+    # Tile (z=4, x=3, y=5) sits over empty composite space (same tile as
+    # TestEmptyTileFastPath).  The exact location doesn't drive results
+    # here - overlapping_regions / sample_coverage / sample_feather are
+    # patched - but keeping it consistent makes the fixtures
+    # deterministic.
+    _Z, _X, _Y, _TILE = 4, 3, 5, 256
+
+    @staticmethod
+    def _chain(model_arr: np.ndarray) -> MagicMock:
+        chain = MagicMock()
+        chain.has_data.return_value = True
+        chain.sample.return_value = model_arr
+        return chain
+
+    @pytest.fixture(autouse=True)
+    def _pin_noise_floor(self, monkeypatch):
+        from librewxr.config import settings
+        monkeypatch.setattr(settings, "noise_floor_dbz", 10.0)  # threshold 84
+
+    @staticmethod
+    def _patch_two_regions(monkeypatch):
+        """Force the tile to overlap USCOMP + CACOMP; only USCOMP has a frame.
+
+        ``sample_coverage`` and ``sample_feather`` are name-based: CACOMP
+        reports full coverage / full feather (it "overlaps" this tile even
+        though it delivered no frame this cycle), USCOMP reports nothing.
+        """
+        from librewxr.tiles import renderer as renderer_mod
+
+        monkeypatch.setattr(
+            renderer_mod, "overlapping_regions",
+            lambda z, x, y, enabled=None: [
+                REGIONS["USCOMP"], REGIONS["CACOMP"],
+            ],
+        )
+        monkeypatch.setattr(
+            renderer_mod, "sample_coverage",
+            lambda name, lat, lon: (
+                np.ones(lat.shape, dtype=bool)
+                if name == "CACOMP" else np.zeros(lat.shape, dtype=bool)
+            ),
+        )
+        monkeypatch.setattr(
+            renderer_mod, "sample_feather",
+            lambda name, lat, lon: (
+                np.ones(lat.shape, dtype=np.float32)
+                if name == "CACOMP" else np.zeros(lat.shape, dtype=np.float32)
+            ),
+        )
+
+    @staticmethod
+    def _empty_uscomp_frame() -> np.ndarray:
+        return np.zeros((COMPOSITE_HEIGHT, COMPOSITE_WIDTH), dtype=np.uint8)
+
+    def test_past_fill_ignores_data_less_region_coverage(self, monkeypatch):
+        """(1) A down region's coverage must not block the NWP fallback fill."""
+        from librewxr.tiles import renderer as renderer_mod
+
+        self._patch_two_regions(monkeypatch)
+        chain = self._chain(np.full((256, 256), 200, dtype=np.uint8))
+        geom = renderer_mod.compute_tile_geometry(
+            {"USCOMP": self._empty_uscomp_frame()},
+            self._Z, self._X, self._Y, tile_size=256,
+            nwp_chain=chain, frame_timestamp=1700000000,
+        )
+        assert geom.is_transparent is False  # pre-fix: tier1_post_fill
+        assert (geom.values == 200).all()
+
+    def test_nowcast_ignores_data_less_region_feather(self, monkeypatch):
+        """(2) A down region's feather must not suppress the model blend."""
+        from librewxr.tiles import renderer as renderer_mod
+
+        self._patch_two_regions(monkeypatch)
+        chain = self._chain(np.full((256, 256), 150, dtype=np.uint8))
+        geom = renderer_mod.compute_tile_geometry(
+            {"USCOMP": self._empty_uscomp_frame()},
+            self._Z, self._X, self._Y, tile_size=256,
+            nwp_chain=chain, frame_timestamp=1700000000, nowcast_blend=0.5,
+        )
+        assert geom.is_transparent is False  # pre-fix: tier1_post_blend
+        assert (geom.values == 150).all()

@@ -26,7 +26,6 @@ import signal
 import sys
 from pathlib import Path
 
-from rich.logging import RichHandler
 import cv2
 
 from librewxr.config import settings
@@ -38,7 +37,7 @@ from librewxr.data.coverage import (
     persist_masks_in_background,
 )
 from librewxr.data.fetcher import RadarFetcher
-from librewxr.data.master_state import dump_state
+from librewxr.data.master_state import snapshot_state, write_state_snapshot
 from librewxr.data.nowcast import NowcastGenerator, NowcastStore
 from librewxr.data.storm_cells import StormCellGenerator, StormCellStore
 from librewxr.data.nwp_source import NWPChain
@@ -46,6 +45,7 @@ from librewxr.data.precip_mask import PrecipMaskStore
 from librewxr.data.radar_cache import RadarFrameCache
 from librewxr.data.regions import REGIONS
 from librewxr.data.store import FrameStore
+from librewxr.logging_setup import setup_logging
 from librewxr.sources import (
     collect_lightning_contributions,
     collect_nowcast_contributions,
@@ -57,51 +57,13 @@ from librewxr.sources import (
     satellite_source_slug,
 )
 from librewxr.tiles.cache import TileCache
+from librewxr.tiles.coordinates import prune_shared_coord_store
 
 # The pipeline writes no tiles itself, but RadarFetcher invalidates a
 # TileCache on frame eviction.  A shared one here would be useless to
 # the render workers (different process, no cross-process invalidation),
 # so we hand it a tiny no-op-effect cache and rely on the render workers
 # to invalidate their own caches when they pick up a new state.json.
-
-_LOG_TAGS = {
-    "librewxr.data_pipeline": "pipeline",
-    "librewxr.config": "config",
-    "librewxr.data.sources": "radar",
-    "librewxr.data.fetcher": "fetcher",
-    "librewxr.data.store": "store",
-    "librewxr.data.regions": "regions",
-    "librewxr.data.coverage": "coverage",
-    "librewxr.sources.world.ifs.grid": "ifs",
-    "librewxr.sources.world.ifs.interpolation": "ifs",
-    "librewxr.sources.regional.north_america.usa.nwp.hrrr.grid": "hrrr",
-    "librewxr.sources.regional.north_america.usa.nwp.hrrr_alaska.grid": "hrrr-ak",
-    "librewxr.sources.regional.europe.nwp.icon_eu.grid": "icon-eu",
-    "librewxr.sources.regional.europe.nwp.dmi_dini.grid": "dmi-dini",
-    "librewxr.sources.regional.north_america.canada.nwp.hrdps.grid": "hrdps",
-    "librewxr.sources.regional.caribbean.nwp.arome_antilles.grid": "arome-ant",
-    "librewxr.sources.regional.south_america.nwp.wrf_smn.grid": "wrf-smn",
-    "librewxr.sources.satellite.gmgsi.source": "gmgsi",
-    "librewxr.data.nowcast": "nowcast",
-    "librewxr.data.master_state": "state",
-    "librewxr.data.alerts_fetcher": "alerts",
-    "librewxr.data.alerts_store": "alerts",
-}
-
-
-class _TagFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        record.tag = _LOG_TAGS.get(record.name, record.name.rsplit(".", 1)[-1])
-        return super().format(record)
-
-
-def _setup_logging() -> None:
-    handler = RichHandler(rich_tracebacks=True, show_path=False)
-    handler.setFormatter(_TagFormatter("[%(tag)s] %(message)s"))
-    logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +219,7 @@ async def run_pipeline() -> None:
     precip_mask_store = PrecipMaskStore(cache_dir=cache_dir)
 
     # Stores keyed by slug — render-only workers consume the same keys
-    # via ``apply_state``.  None entries are skipped by dump_state.
+    # via ``apply_state``.  None entries are skipped by snapshot_state.
     stores = {
         "frame_store": store,
         **nwp_grids_by_slug,
@@ -274,10 +236,20 @@ async def run_pipeline() -> None:
             await precip_mask_store.build(stores, nwp_chain, settings)
         except Exception:
             logger.exception("Failed to build precip mask")
+        # snapshot_state is pure in-memory dict building (fast) — take the
+        # consistent snapshot on the loop, then hand the JSON encode +
+        # atomic rename to a worker thread so the serialisation never
+        # blocks the event loop.
+        payload = snapshot_state(stores)
         try:
-            dump_state(stores, cache_dir)
+            await asyncio.to_thread(write_state_snapshot, payload, cache_dir)
         except Exception:
             logger.exception("Failed to dump master state snapshot")
+        # The pipeline owns coord-store maintenance in multi mode (render
+        # workers never prune).  Guard-free: _get_store()'s gate covers
+        # enabled/cache_dir and the helper never raises.  The directory
+        # scans run in a worker thread so they never block the loop.
+        await asyncio.to_thread(prune_shared_coord_store)
 
     fetcher = RadarFetcher(
         store, tile_cache,
@@ -342,7 +314,7 @@ async def run_pipeline() -> None:
 
 
 def main() -> None:
-    _setup_logging()
+    setup_logging()
     # The pipeline's heavy cv2 work (Farneback nowcast flow) runs once per fetch cycle; 8 threads is ample for the <=1000px flow grids and stays well inside the pipeline container's CPU cap.
     cv2.setNumThreads(8)
     try:

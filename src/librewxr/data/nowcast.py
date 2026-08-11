@@ -33,6 +33,7 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -191,7 +192,9 @@ class NowcastStore:
     memory-mapped temp files so the OS page cache manages physical RAM.
     """
 
-    def __init__(self, cache_dir: Path | None = None):
+    def __init__(
+        self, cache_dir: Path | None = None, *, cleanup_tmp: bool = True,
+    ):
         self._frames: dict[int, NowcastFrame] = {}
         # Per-region optical flow, stored at the resolution it was
         # COMPUTED at (longest dim ≤ _TARGET_FLOW_DIM, vectors in
@@ -210,9 +213,14 @@ class NowcastStore:
             self._memmap_dir = Path(tempfile.mkdtemp(prefix="librewxr_nowcast_"))
             self._persistent = False
         self._memmap_dir.mkdir(parents=True, exist_ok=True)
-        for path in self._memmap_dir.glob("*.tmp"):
-            path.unlink(missing_ok=True)
-        logger.info(
+        # The ``*.tmp`` unlink is a stale-leftover sweep for the store's
+        # OWN dir.  A render worker resurrecting a shared (multi-mode)
+        # store mid-run must skip it — the pipeline process may be
+        # concurrently writing ``.dat.tmp`` files it is about to rename.
+        if cleanup_tmp:
+            for path in self._memmap_dir.glob("*.tmp"):
+                path.unlink(missing_ok=True)
+        logger.debug(
             "Nowcast memmap directory: %s (persistent=%s)",
             self._memmap_dir, self._persistent,
         )
@@ -220,7 +228,16 @@ class NowcastStore:
     def _to_memmap(self, name: str, data: np.ndarray) -> np.ndarray:
         """Write array to disk atomically and return a read-only memory-mapped view."""
         final = self._memmap_dir / f"{name}.dat"
-        tmp = final.with_suffix(".dat.tmp")
+        # The nowcast dir is shared across processes in multi mode (the
+        # pipeline writes it, render workers read it via state.json).  A
+        # deterministic tmp name lets a concurrent writer's rename steal
+        # the file out from under this writer's os.replace (production
+        # incident); pid+uuid makes writers independent — both succeed,
+        # and the last replace wins the final name atomically.  The
+        # constructor's stale-``*.tmp`` sweep still matches these names.
+        tmp = final.with_name(
+            f"{final.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
         mm = np.memmap(tmp, dtype=data.dtype, mode="w+", shape=data.shape)
         mm[:] = data
         mm.flush()
@@ -340,8 +357,21 @@ class NowcastStore:
         self._flows.clear()
         self._nwp_flow = None
 
-    def __getstate__(self) -> dict:
-        """Serialize state for cross-process reload (multi-worker mode)."""
+    def __getstate__(self) -> dict | None:
+        """Serialize state for cross-process reload (multi-worker mode).
+
+        Returns ``None`` while the store holds no content — an all-empty
+        store means the first generation is still in flight after a
+        pipeline boot, and dumping it would null populated nowcast stores
+        on serving render workers (production incident).  ``dump_state``
+        skips stores whose ``__getstate__`` returns ``None``, so the
+        worker keeps its current frames until the first real generation
+        lands.  The all-three-empty condition keeps arrow-flow-only
+        configurations correct: a store with flows but no frames is a
+        valid, dumpable state.
+        """
+        if not self._frames and not self._flows and self._nwp_flow is None:
+            return None
         frames_state: list[dict] = []
         for ts, frame in self._frames.items():
             regions: dict[str, list] = {}
@@ -378,7 +408,37 @@ class NowcastStore:
         }
 
     def __setstate__(self, state: dict) -> None:
-        """Restore state from the dict produced by ``__getstate__``."""
+        """Restore state from the dict produced by ``__getstate__``.
+
+        Stale memmap files are tolerated — a snapshot can reference files
+        the pipeline has since deleted (dump/generation ordering window),
+        so missing files degrade the store instead of failing it: a frame
+        with any missing region file is skipped wholesale (a partial frame
+        would render misleading partial tiles), a missing flow file skips
+        just that region's flow (arrows for the region suppress until the
+        next cycle), and a missing ``nwp_flow`` file becomes ``None``.
+        Genuine corruption (other exceptions) still propagates so
+        ``apply_state`` can log it.
+        """
+        # Belt-and-suspenders apply-side guard: an all-empty payload
+        # carries no information and historically meant "first generation
+        # in flight" — keep serving the current frames/flows.  With
+        # ``__getstate__`` returning ``None`` for empty stores, current
+        # pipelines never emit such payloads; this only defends against
+        # snapshots from older builds or hand-crafted payloads.  A store
+        # that is itself empty applies the payload normally (a no-op),
+        # and a payload with frames=[] but non-empty flows (arrow-only
+        # path) still applies — it is a valid, information-bearing state.
+        incoming_empty = (
+            not state.get("frames")
+            and not state.get("flows")
+            and state.get("nwp_flow") is None
+        )
+        holding_content = (
+            bool(self._frames) or bool(self._flows) or self._nwp_flow is not None
+        )
+        if incoming_empty and holding_content:
+            return
         memmap_dir = Path(state["memmap_dir"])
         new_frames: dict[int, NowcastFrame] = {}
         for f_info in state["frames"]:
@@ -387,21 +447,33 @@ class NowcastStore:
                 timestamp=ts,
                 blend_weight=float(f_info["blend_weight"]),
             )
-            for name, (basename, dtype_str, shape) in f_info["regions"].items():
-                frame.regions[name] = np.memmap(
-                    memmap_dir / basename,
-                    dtype=np.dtype(dtype_str), mode="r",
-                    shape=tuple(shape),
-                )
+            try:
+                for name, (basename, dtype_str, shape) in f_info["regions"].items():
+                    frame.regions[name] = np.memmap(
+                        memmap_dir / basename,
+                        dtype=np.dtype(dtype_str), mode="r",
+                        shape=tuple(shape),
+                    )
+            except FileNotFoundError:
+                # Stale frame file race — the pipeline replaced the set of
+                # frames between dump and this read.  Skip the WHOLE frame:
+                # a partial frame would render misleading partial tiles.
+                logger.debug("Nowcast: skipping stale frame %d", ts)
+                continue
             new_frames[ts] = frame
 
         new_flows: dict[str, np.ndarray] = {}
         for name, (basename, dtype_str, shape) in state["flows"].items():
-            new_flows[name] = np.memmap(
-                memmap_dir / basename,
-                dtype=np.dtype(dtype_str), mode="r",
-                shape=tuple(shape),
-            )
+            try:
+                new_flows[name] = np.memmap(
+                    memmap_dir / basename,
+                    dtype=np.dtype(dtype_str), mode="r",
+                    shape=tuple(shape),
+                )
+            except FileNotFoundError:
+                # Stale flow file race — skip just this region's flow;
+                # arrows for the region suppress until the next cycle.
+                logger.debug("Nowcast: skipping stale flow %s", name)
 
         new_nwp_flow = None
         # Older snapshots written before the hybrid arrow path landed
@@ -409,11 +481,16 @@ class NowcastStore:
         nwp_state = state.get("nwp_flow")
         if nwp_state is not None:
             nw_basename, nw_dtype, nw_shape = nwp_state
-            new_nwp_flow = np.memmap(
-                memmap_dir / nw_basename,
-                dtype=np.dtype(nw_dtype), mode="r",
-                shape=tuple(nw_shape),
-            )
+            try:
+                new_nwp_flow = np.memmap(
+                    memmap_dir / nw_basename,
+                    dtype=np.dtype(nw_dtype), mode="r",
+                    shape=tuple(nw_shape),
+                )
+            except FileNotFoundError:
+                # Stale nwp_flow file race — the arrow overlay outside
+                # radar coverage simply doesn't render until the next cycle.
+                new_nwp_flow = None
 
         self._memmap_dir = memmap_dir
         self._frames = new_frames
@@ -430,7 +507,7 @@ class NowcastStore:
             logger.info("Nowcast memmaps retained on disk at %s", self._memmap_dir)
         else:
             shutil.rmtree(self._memmap_dir, ignore_errors=True)
-            logger.info("Nowcast memmap directory cleaned up")
+            logger.debug("Nowcast memmap directory cleaned up")
 
 
 # ---------------------------------------------------------------------------
@@ -592,14 +669,14 @@ class NowcastGenerator:
             if self._cache is not None:
                 for ts in old_timestamps:
                     self._cache.invalidate_timestamp(ts)
-            logger.info(
+            logger.debug(
                 "Nowcast updated: %d frames (T+%d to T+%d min)",
                 len(nowcast_frames),
                 interval // 60,
                 n_steps * interval // 60,
             )
         elif flows:
-            logger.info(
+            logger.debug(
                 "Arrow flow updated: %d region%s (nowcast disabled)",
                 len(flows), "s" if len(flows) != 1 else "",
             )
