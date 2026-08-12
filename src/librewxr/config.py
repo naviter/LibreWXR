@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     fetch_interval: int = 600  # seconds between fetches (10 min = radar frame cadence)
     max_frames: int = 12
     max_zoom: int = 12
+    # Radar-staleness threshold for the /health/updown external-monitor
+    # endpoint (see api/routes.py: health_updown).  Default 1500s = 2.5
+    # missed fetch_interval cycles - enough slack for one slow NWP-heavy
+    # cycle (observed up to ~450s) without false-positiving on normal
+    # jitter, while catching real stalls (seen: 45min swap thrash, 4.5h
+    # EMFILE freeze) with hours of margin before a human would notice.
+    updown_stale_threshold_seconds: int = 1500
     # Root log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
     # (case-insensitive; normalized to uppercase by the validator).
     log_level: str = "INFO"

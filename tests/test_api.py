@@ -398,6 +398,80 @@ class TestHealthEndpoint:
         assert data["coord_caches"]["store"] == store_stats
 
 
+class TestHealthUpdown:
+    """The /health/updown external-monitor endpoint."""
+
+    _HEADERS = {"client": "updown.io"}
+
+    def test_rejects_missing_header(self, client):
+        c, _, _ = client
+        resp = c.get("/health/updown")
+        assert resp.status_code == 403
+
+    def test_rejects_wrong_header(self, client):
+        c, _, _ = client
+        resp = c.get("/health/updown", headers={"client": "someone-else"})
+        assert resp.status_code == 403
+
+    def test_healthy_when_fresh(self, client):
+        """The fixture's frame is < 5 min old, well under the default
+        1500s threshold, so this must read as healthy with no hint."""
+        c, ts, _ = client
+        resp = c.get("/health/updown", headers=self._HEADERS)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert "hint" not in data
+        assert data["info"]["radar_latest_age_seconds"] == pytest.approx(
+            time.time() - ts, abs=5
+        )
+
+    def test_warning_when_stale(self, client, monkeypatch):
+        monkeypatch.setattr(settings, "updown_stale_threshold_seconds", 1)
+        c, _, _ = client
+        resp = c.get("/health/updown", headers=self._HEADERS)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "warning"
+        assert "old" in data["hint"]
+
+    def test_warning_when_no_frames(self, client, monkeypatch):
+        from librewxr.data.store import FrameStore
+
+        monkeypatch.setattr(routes, "frame_store", FrameStore(max_frames=12))
+        c, _, _ = client
+        resp = c.get("/health/updown", headers=self._HEADERS)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "warning"
+        assert data["hint"] == "No radar frames in store"
+        assert data["info"]["radar_latest_age_seconds"] is None
+
+    def test_lightning_ages_reported_but_dont_gate(self, client, monkeypatch):
+        """A wildly stale lightning network must not flip the overall
+        status - only radar freshness gates /health/updown (see the
+        route's docstring: every real incident broke both together, so a
+        second threshold would only add alert-fatigue risk)."""
+
+        class _StubLightning:
+            timestamps = [1]  # 1970 - ancient
+
+        monkeypatch.setattr(
+            routes, "lightning_grids", {"glm_grid": _StubLightning()},
+        )
+        c, _, _ = client
+        resp = c.get("/health/updown", headers=self._HEADERS)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["info"]["lightning_latest_age_seconds"]["glm_grid"] > 1_000_000_000
+
+    def test_not_cached(self, client):
+        c, _, _ = client
+        resp = c.get("/health/updown", headers=self._HEADERS)
+        assert resp.headers["cache-control"] == "no-store"
+
+
 class TestHealthCluster:
     """The /health ``cluster`` section aggregating the worker pulses."""
 

@@ -12,7 +12,7 @@ import psutil
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request, Response
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 from librewxr.api.models import (
     AlertProperties,
@@ -660,6 +660,77 @@ async def health():
             "per_region": await storm_cell_store.get_counts() if storm_cell_store is not None else {},
         } if settings.storm_cells_enabled else {"enabled": False},
     }
+
+
+@router.get("/health/updown")
+async def health_updown(request: Request) -> Response:
+    """External-monitor health signal, compatible with Navigator's UpDownWorker.
+
+    A distinct, deliberately narrow endpoint — ``/health`` above is a rich
+    diagnostic dump for us; this one answers a single yes/no question an
+    external monitor cares about: "is the data a user would see fresh?".
+    Sits under ``location /`` in nginx (the open catch-all, same as
+    ``/health``), so it needs no API key and no nginx changes.
+
+    Mirrors the ``{status, hint, info}`` contract Navigator's
+    ``HealthService``/``UpDownService`` already speak for every other
+    internal-type monitor (see ``navigator/backend/backend/lib/service/
+    updown_service.dart`` — ``_parseInternalResponse`` reads exactly this
+    shape) so registering this URL as an ``internal`` UpDown endpoint is
+    the only integration work needed; no new alerting code.  Requires the
+    same ``client: updown.io`` header Navigator's checker sends for
+    internal endpoints, matching ``HealthService.get``/``post``'s gate —
+    keeps this from being a trivially guessable "is the weather server
+    currently broken" probe.
+
+    Gates on radar freshness only.  Lightning ages ride along in ``info``
+    for a human reading the alert, but don't independently trigger a
+    warning: every incident to date (swap thrash, EMFILE) broke radar and
+    lightning together since both come from the same fetch cycle, so a
+    second threshold would add alert-fatigue risk without adding coverage.
+    """
+    if request.headers.get("client") != "updown.io":
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    now = int(time.time())
+    timestamps = await frame_store.get_timestamps()
+    latest_ts = max(timestamps) if timestamps else None
+    age = now - latest_ts if latest_ts is not None else None
+
+    lightning_info = {
+        slug: (now - grid.timestamps[-1]) if grid is not None and grid.timestamps else None
+        for slug, grid in lightning_grids.items()
+    }
+
+    info = {
+        "radar_latest_age_seconds": age,
+        "radar_frame_count": len(timestamps),
+        "lightning_latest_age_seconds": lightning_info,
+    }
+
+    if latest_ts is None:
+        status, hint = "warning", "No radar frames in store"
+    elif age > settings.updown_stale_threshold_seconds:
+        status, hint = (
+            "warning",
+            f"Radar data is {age}s old (threshold {settings.updown_stale_threshold_seconds}s)",
+        )
+    else:
+        status, hint = "healthy", None
+
+    body = {
+        "status": status,
+        "info": info,
+        "updated_at": datetime.fromtimestamp(now, tz=timezone.utc).isoformat(),
+    }
+    if hint is not None:
+        body["hint"] = hint
+
+    return Response(
+        content=json.dumps(body),
+        media_type="application/json",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def _content_type(ext: str) -> str:
