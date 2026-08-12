@@ -794,6 +794,8 @@ class RadarFetcher:
         tasks = []
         task_meta: list[tuple[int, RegionDef, str, int | datetime]] = []
 
+        fetch_timeout = settings.radar_fetch_timeout_seconds
+
         for ts, source_type, source_arg in ts_and_sources:
             have = skip_regions.get(ts, set()) if skip_regions else set()
             carried = self._carried_regions.get(ts, set())
@@ -802,9 +804,18 @@ class RadarFetcher:
                     continue
                 source = self._sources[region.name]
                 if source_type == "live":
-                    tasks.append(source.fetch_frame(region, source_arg))
+                    coro = source.fetch_frame(region, source_arg)
                 else:
-                    tasks.append(source.fetch_archive_frame(region, source_arg))
+                    coro = source.fetch_archive_frame(region, source_arg)
+                # Bounds ONE region's fetch, not the whole gather — a source
+                # whose connection keeps trickling data too slowly to ever
+                # trip its own read timeout must not hold up every other
+                # region's merge/carry-forward/store-write behind it.  See
+                # settings.radar_fetch_timeout_seconds for the incident this
+                # guards against.  TimeoutError flows into `results` exactly
+                # like any other per-region exception (return_exceptions=True
+                # below) and is handled by the existing warn-and-skip path.
+                tasks.append(asyncio.wait_for(coro, timeout=fetch_timeout))
                 task_meta.append((ts, region, source_type, source_arg))
 
         radar_start = time.monotonic()
@@ -830,8 +841,17 @@ class RadarFetcher:
         finalize_meta: list[tuple[int, RegionDef, str, int | datetime]] = []
         for (ts, region, source_type, source_arg), result in zip(task_meta, results):
             if isinstance(result, Exception):
+                # str(TimeoutError()) is empty, so name it explicitly —
+                # this is the one log line that distinguishes "hit the
+                # radar_fetch_timeout_seconds ceiling" from every other
+                # per-region failure when reading back after the fact.
+                detail = (
+                    f"exceeded radar_fetch_timeout_seconds ({settings.radar_fetch_timeout_seconds}s)"
+                    if isinstance(result, TimeoutError)
+                    else str(result)
+                )
                 logger.warning(
-                    "Failed to fetch %s for ts=%d: %s", region.name, ts, result
+                    "Failed to fetch %s for ts=%d: %s", region.name, ts, detail
                 )
                 continue
             finalize_coros.append(

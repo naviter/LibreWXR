@@ -65,6 +65,23 @@ class Settings(BaseSettings):
     # jitter, while catching real stalls (seen: 45min swap thrash, 4.5h
     # EMFILE freeze) with hours of margin before a human would notice.
     updown_stale_threshold_seconds: int = 1500
+    # Wall-clock ceiling on ONE region's fetch_frame/fetch_archive_frame
+    # call within a fetch cycle's radar gather().  httpx.Timeout on each
+    # source's client caps time between reads (typically 90s), not total
+    # transfer time — a connection that keeps trickling a few bytes every
+    # <90s never trips it, and asyncio.gather() waits for every task, so
+    # one such source blocks ALL regions' merge/carry-forward/store-write
+    # until it finally finishes or errors.  Confirmed in production
+    # 2026-08-12: CWA (Taiwan, cwaopendata S3 in ap-northeast-1) held the
+    # radar phase open 87-110 minutes twice in three hours with zero
+    # timeout/retry logged, because it kept receiving data too slowly to
+    # ever trip the per-read timeout.  180s is comfortably above the
+    # worst normal case (one retry_get retry at up to ~90s read + 15s
+    # connect each, twice, ~200s) while far below a stuck-trickle stall;
+    # a region that blows through it is carry-forwarded like any other
+    # transient failure and retried next cycle — the same low-visibility
+    # path JPCOMP already takes daily when it publishes late.
+    radar_fetch_timeout_seconds: float = 180.0
     # Root log level: DEBUG / INFO / WARNING / ERROR / CRITICAL
     # (case-insensitive; normalized to uppercase by the validator).
     log_level: str = "INFO"

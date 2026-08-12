@@ -494,6 +494,79 @@ class TestCarryForward:
         assert carried[0, 0] == 77  # still readable, original value
 
 
+class _HangingSource:
+    """A source whose fetch never returns on its own — simulates a
+    connection that keeps trickling bytes too slowly to ever trip its
+    own httpx read timeout (the 2026-08-12 CWA/ap-northeast-1 incident:
+    asyncio.gather() waits for every task, so one such source blocked
+    the ENTIRE radar phase for 87-110 minutes with nothing to catch it).
+    """
+
+    async def fetch_frame(self, region, minutes_ago):
+        await asyncio.sleep(3600)
+        raise AssertionError("should have been cancelled by radar_fetch_timeout_seconds")
+
+    async def fetch_archive_frame(self, region, dt):
+        await self.fetch_frame(region, 0)
+
+
+class TestFetchTimeoutIsolation:
+    """radar_fetch_timeout_seconds bounds ONE region, not the whole cycle."""
+
+    @pytest.fixture
+    def regions(self):
+        def make(name):
+            return RegionDef(
+                name=name, west=0.0, east=3.2, south=0.0, north=3.2,
+                pixel_size=0.1, group="US", grid_width=32, grid_height=32,
+            )
+        return make("TESTFAST"), make("TESTSLOW")
+
+    @pytest.mark.asyncio
+    async def test_hung_region_is_skipped_not_blocking(self, regions, monkeypatch):
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_fetch_timeout_seconds", 0.05)
+        fast_region, slow_region = regions
+        store = FrameStore(max_frames=4)
+        fetcher, fast_source = _build_fetcher(store, TileCache(max_mb=1), None, fast_region)
+        fetcher._enabled_regions = [fast_region, slow_region]
+        fetcher._sources[slow_region.name] = _HangingSource()
+
+        started = asyncio.get_event_loop().time()
+        await fetcher._fetch_timestamps([(1000, "live", 0)])
+        elapsed = asyncio.get_event_loop().time() - started
+
+        # Proves wait_for actually cancelled the hang rather than the test
+        # genuinely waiting out the source's 3600s sleep.
+        assert elapsed < 5.0
+
+        frame = await store.get_frame(1000)
+        assert "TESTFAST" in frame.regions  # the fast region still landed
+        assert "TESTSLOW" not in frame.regions  # the hung one was skipped
+        assert fast_source.live_calls == [("TESTFAST", 0)]
+
+    @pytest.mark.asyncio
+    async def test_timeout_logs_a_named_reason(self, regions, monkeypatch, caplog):
+        """str(TimeoutError()) is empty - the warning must name the cause
+        explicitly or a future incident is back to live-diagnosing it."""
+        from librewxr.config import settings
+
+        monkeypatch.setattr(settings, "radar_fetch_timeout_seconds", 0.05)
+        _fast_region, slow_region = regions
+        store = FrameStore(max_frames=4)
+        fetcher, _fast_source = _build_fetcher(store, TileCache(max_mb=1), None, slow_region)
+        fetcher._sources[slow_region.name] = _HangingSource()
+
+        with caplog.at_level("WARNING"):
+            await fetcher._fetch_timestamps([(1000, "live", 0)])
+
+        assert any(
+            "TESTSLOW" in r.message and "radar_fetch_timeout_seconds" in r.message
+            for r in caplog.records
+        )
+
+
 class TestCarryForwardRefetch:
     """A carried-forward region must not permanently mask the slot.
 
