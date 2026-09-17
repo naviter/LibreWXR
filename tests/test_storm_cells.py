@@ -35,11 +35,13 @@ _DEFAULT_PX_TO_KM2 = _DEFAULT_PS_LON_KM * _DEFAULT_PS_LAT_KM  # ~1.2321
 def _make_region(
     name: str = "SYNTH_REGION",
     pixel_size: float = _DEFAULT_PS,
+    storm_cells: bool = True,
 ) -> RegionDef:
     return RegionDef(
         name=name,
         west=0.0, east=10.0, south=0.0, north=10.0,
         pixel_size=pixel_size, group="TEST",
+        storm_cells=storm_cells,
     )
 
 
@@ -253,6 +255,32 @@ class TestDetectStormCells:
         assert "SYNTH_REGION" in result
         assert "SYNTH_REGION_2" not in result
 
+    @pytest.mark.storm_cells
+    def test_skips_regions_flagged_storm_cells_false(self, syn_regions, monkeypatch):
+        """Regions with ``RegionDef.storm_cells=False`` (the coarse global
+        fill layer) are skipped even when enabled."""
+        from librewxr.data import regions as _regions_mod
+
+        no_cells = _make_region("SYNTH_NO_CELLS", storm_cells=False)
+        monkeypatch.setitem(_regions_mod.REGIONS, "SYNTH_NO_CELLS", no_cells)
+
+        frame = np.zeros((100, 100), dtype=np.uint8)
+        frame[20:30, 30:40] = 160
+        result = detect_storm_cells(
+            latest_frame_regions={
+                "SYNTH_REGION": frame,
+                "SYNTH_NO_CELLS": frame,
+            },
+            enabled_regions=["SYNTH_REGION", "SYNTH_NO_CELLS"],
+            flows_by_region=None,
+            min_dbz=40,
+            min_area_km2=2.0,
+            fetch_interval_s=600,
+        )
+        assert "SYNTH_REGION" in result
+        assert len(result["SYNTH_REGION"]) == 1
+        assert "SYNTH_NO_CELLS" not in result
+
 
 # ---------------------------------------------------------------------------
 # StormCellStore tests
@@ -318,6 +346,66 @@ class TestStormCellStore:
             assert new_store.total_count == 1
             assert new_store.last_updated == pytest.approx(store.last_updated, abs=0.1)
 
+            new_store.cleanup()
+        finally:
+            store.cleanup()
+
+    @pytest.mark.storm_cells
+    async def test_replace_cells_bumps_version(self):
+        """Each replace_cells swap bumps cells_version by exactly 1."""
+        store = StormCellStore()
+        try:
+            assert store.cells_version == 0
+            arr = np.array([
+                (10.0, 20.0, 50.0, 61.6, 45.0,
+                 0.0, 0.0, float("nan"), float("nan")),
+            ], dtype=_CELL_DTYPE)
+            await store.replace_cells({"TEST": arr})
+            assert store.cells_version == 1
+            await store.replace_cells({"TEST": arr})
+            assert store.cells_version == 2
+        finally:
+            store.cleanup()
+
+    @pytest.mark.storm_cells
+    async def test_state_round_trip_preserves_version(self, tmp_path):
+        """__getstate__/__setstate__ round-trips cells_version."""
+        store = StormCellStore(cache_dir=tmp_path)
+        try:
+            arr = np.array([
+                (10.0, 20.0, 50.0, 61.6, 45.0,
+                 0.0, 0.0, float("nan"), float("nan")),
+            ], dtype=_CELL_DTYPE)
+            await store.replace_cells({"TEST": arr})
+            await store.replace_cells({"TEST": arr})
+            assert store.cells_version == 2
+
+            state = store.__getstate__()
+            new_store = StormCellStore()
+            new_store.__setstate__(state)
+            assert new_store.cells_version == 2
+            new_store.cleanup()
+        finally:
+            store.cleanup()
+
+    @pytest.mark.storm_cells
+    async def test_setstate_missing_version_bumps_local(self, tmp_path):
+        """A legacy snapshot without ``cells_version`` bumps the local
+        version by 1 (conservative fallback) instead of resetting it."""
+        store = StormCellStore(cache_dir=tmp_path)
+        try:
+            arr = np.array([
+                (10.0, 20.0, 50.0, 61.6, 45.0,
+                 0.0, 0.0, float("nan"), float("nan")),
+            ], dtype=_CELL_DTYPE)
+            await store.replace_cells({"TEST": arr})
+            state = store.__getstate__()
+            del state["cells_version"]  # simulate an older pipeline snapshot
+
+            new_store = StormCellStore()
+            assert new_store.cells_version == 0
+            new_store.__setstate__(state)
+            assert new_store.cells_version == 1
             new_store.cleanup()
         finally:
             store.cleanup()

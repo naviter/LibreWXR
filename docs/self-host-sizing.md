@@ -41,7 +41,7 @@ weather alerts - serving real public traffic at ~15 requests/s average
 |---|---|---|---|---|---|
 | Minimum (public) | multi | 8 vCPU | 16 GiB | 50 GiB SSD | 4-8 |
 | Recommended (public production) | multi | 16 vCPU | 32 GiB | 50-100 GiB SSD | 8-12 |
-| Heavy / no CDN | multi | 32 vCPU | 64 GiB | 100 GiB SSD | up to 32 |
+| Heavy / no CDN | multi | 32 vCPU | 64 GiB | 100 GiB SSD | up to 16 (the c7i.8xlarge's 32 vCPUs are hyperthreaded - 16 physical cores; follow the physical-core rule) |
 
 The **minimum** tier is the floor for public traffic - below it, single
 mode behind a proxy is the honest shape. The **recommended** tier serves
@@ -117,6 +117,15 @@ soft cap - `LIBREWXR_COORD_STORE_MB` - is a **disk** budget, not RAM
 (default 8192 in multi mode; lower it on small disks - it prunes once
 per fetch cycle).
 
+**RRQPE memory:** the RRQPE observed-precipitation layer (NOAA
+Enterprise Rain Rate) is now a radar region, so its frames live in the
+FrameStore like any other region: 12 past frames × ~29 MB at the
+default downsample (`LIBREWXR_RRQPE_DOWNSAMPLE=2`, 0.04° stored) is
+~350 MB, plus ~175 MB of nowcast-extrapolated frames (6 × ~29 MB) and
+transient warp buffers comparable to USCOMP's existing peaks.  Net add
+versus the old NWP-source form is roughly the nowcast half.  Factor 4
+(0.08°) cuts a frame to ~7 MB; factor 1 (native 0.02°) is ~117 MB.
+
 ## Configuration Knobs
 
 | Setting | Role |
@@ -126,13 +135,19 @@ per fetch cycle).
 | `LIBREWXR_NWP_FETCH_CONCURRENCY` | Parallel NWP grid decodes in the pipeline; drives decode-time RAM bursts. |
 | `LIBREWXR_COORD_STORE_MB` | Disk budget for the shared coordinate store (not RAM). |
 | `LIBREWXR_CACHE_DIR` | Shared cache directory - required for multi mode. Put it on SSD. |
+| `LIBREWXR_MEMORY` | Memory limit for the single-mode container; `compose default`. |
+| `LIBREWXR_PIPELINE_MEMORY` | Memory limit for the pipeline sidecar (multi mode); `12G` compose default. |
+| `LIBREWXR_RENDER_MEMORY` | Memory limit for render workers (multi mode); `18G` compose default. |
+
+The compose defaults sum to ~30 GiB of limits in multi mode (12G pipeline + 18G renderers) - scale these down via the three LIBREWXR_*_MEMORY vars on smaller hosts; the 16 GiB minimum tier assumes they have been reduced.
 
 ## Bandwidth
 
 Tiles run ~50 KB each as WebP. At the reference workload's ~15 req/s
-average that is roughly **10 Mbps** of sustained egress - plan for
-bursts several times higher (storms make people refresh, and animations
-re-request the same timestamped tiles). A CDN absorbs the duplication at
-the edge, so origin egress usually stays far below the headline number.
+average that is roughly **6 Mbps** of sustained egress (a bit more with
+protocol overhead) - plan for bursts several times higher (storms make
+people refresh, and animations re-request the same timestamped tiles).
+A CDN absorbs the duplication at the edge, so origin egress usually stays
+far below the headline number.
 
 _Note: These rough specs were calculated by Kimi K3 in OpenCode. They may not be perfectly accurate, but it does roughly estimate what my own server capacity would be at those levels from my experience. Your results may vary based on what features are enabled or tweaked. - J.Kimsey_

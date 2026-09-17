@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import random
+import signal
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -44,13 +45,18 @@ from librewxr.sources import (
     collect_nwp_contributions,
     collect_radar_coverage_metadata,
     collect_satellite_contributions,
+    enabled_regions_with_always_on,
     lightning_source_slug,
     nwp_grid_slug,
     satellite_source_slug,
 )
 from librewxr.data.alerts_store import AlertsStore
 from librewxr.data.alerts_fetcher import WMOAlertsFetcher
-from librewxr.memory import MemoryMonitor, detect_memory_limit_mb
+from librewxr.memory import (
+    MemoryMonitor,
+    describe_cgroup_memory,
+    detect_memory_limit_mb,
+)
 from librewxr.logging_setup import setup_logging
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import (
@@ -321,16 +327,15 @@ def _maintain_shared_tiles(store, full_clear: bool, ts_set: set[int] | None) -> 
     any in-flight publishes: a concurrent publisher's ``.tmp`` survives
     and its os.replace lands a current-version entry, while every
     published file is removed so stale-NWP content is still fully
-    reclaimed.  ``prune`` runs every pass so cross-worker publishes never
-    grow the store past its budget; it full-scans, hence off the event
-    loop.
+    reclaimed.  ``prune`` (the full on-disk scan / budget enforcement) is
+    owned by the pipeline process, which prunes once per fetch cycle;
+    render workers only do correctness invalidation here.
     """
     if full_clear:
         store.sweep_final_files()
     else:
         for ts in ts_set:
             store.invalidate_timestamp(ts)
-    store.prune()
 
 
 def _drop_absent_stores(stores: dict, refreshed: list[str]) -> None:
@@ -441,7 +446,9 @@ async def _render_only_lifespan(app: FastAPI):
     # Shared on-disk encoded-tile store: one worker's encode serves all
     # workers (plain past-frame tiles only; see routes.radar_tile).  The
     # content-versioned keys make stale entries unreachable between fetch
-    # cycles, so the poller only reclaims space (see _maintain_shared_tiles).
+    # cycles, so the poller only does correctness invalidation on
+    # signature changes (see _maintain_shared_tiles; the pipeline process
+    # owns budget pruning, once per fetch cycle).
     # Auto = 2048 MB for render workers; 0 or negative disables.
     shared_tiles = None
     mb = settings.shared_tile_store_mb
@@ -536,7 +543,10 @@ async def _render_only_lifespan(app: FastAPI):
     storm_cell_store = stores["storm_cell_store"]
     alerts_store = stores["alerts_store"]
 
-    enabled = settings.get_enabled_regions()
+    # The enabled set includes every always-on contribution region (the
+    # coarse global observed tier stays fetchable/renderable even under a
+    # narrow region spec).
+    enabled = enabled_regions_with_always_on(settings)
     station_map, range_overrides, coverage_polygons = collect_radar_coverage_metadata(settings)
     # Prefer the persisted masks (read-only memmap) when the pipeline has
     # already saved a set built from identical parameters; otherwise build
@@ -586,8 +596,12 @@ async def _render_only_lifespan(app: FastAPI):
     # compute pool, floored at 2 - presents are short-lived, computes are
     # the bottleneck.
     present_executor = ThreadPoolExecutor(max_workers=max(2, pool_size // 2))
+    # Dedicated pool for shared-tile-store I/O + state-snapshot apply so
+    # they never queue behind geometry computes on the default executor.
+    io_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix='tile-io')
     asyncio.get_running_loop().set_default_executor(request_executor)
     routes.present_executor = present_executor
+    routes.io_executor = io_executor
 
     mem_limit = detect_memory_limit_mb(settings.memory_limit_mb)
     monitor = MemoryMonitor(
@@ -676,8 +690,8 @@ async def _render_only_lifespan(app: FastAPI):
                 # invalidation stays on the loop: it compares payload
                 # content, not in-memory store state, so skipping
                 # __setstate__ for unchanged stores never affects it.
-                payload, refreshed = await asyncio.to_thread(
-                    _load_and_apply_state, cache_dir, stores, last_payload,
+                payload, refreshed = await asyncio.get_running_loop().run_in_executor(
+                    io_executor, _load_and_apply_state, cache_dir, stores, last_payload,
                 )
                 if payload is None:
                     continue
@@ -718,10 +732,10 @@ async def _render_only_lifespan(app: FastAPI):
                         cache.invalidate_timestamp(ts)
                 if shared_tiles is not None:
                     # Same invalidation semantics for the shared on-disk
-                    # encoded-tile store.  prune is a full on-disk scan
-                    # (and the store ops are file I/O), so the whole
-                    # maintenance pass runs off the event loop.
-                    await asyncio.to_thread(
+                    # encoded-tile store.  The store ops are file I/O, so
+                    # the whole maintenance pass runs off the event loop.
+                    await asyncio.get_running_loop().run_in_executor(
+                        io_executor,
                         _maintain_shared_tiles,
                         shared_tiles, full_clear, ts_to_invalidate,
                     )
@@ -787,9 +801,11 @@ async def _render_only_lifespan(app: FastAPI):
         await monitor.stop()
         request_executor.shutdown(wait=False)
         present_executor.shutdown(wait=False)
+        io_executor.shutdown(wait=False)
         # Unwire the routes handle so a stale reference to a shut-down pool
         # can never be scheduled against (single mode always keeps None).
         routes.present_executor = None
+        routes.io_executor = None
         cache.clear()
         store.cleanup()
         if nowcast_store is not None:
@@ -813,8 +829,13 @@ async def lifespan(app: FastAPI):
     # Walk the auto-discovered NWP providers under ``librewxr.sources``;
     # each returns a contribution (or ``None`` when its config flag is
     # off).  Chain order is set by ``NWPContribution.priority``: HRRR
-    # (10) → HRRR-Alaska (11) → HRDPS (20) → AROME Antilles (25) → DMI
-    # DINI (30) → ICON-EU (35) → WRF-SMN (40) → IFS (1000 — catch-all).
+    # (10) → HRRR-Alaska (11) → HRDPS (20) → JMA MSM (20) → AROME
+    # Antilles (25) → AROME Guyane (26) → AROME Indien (27) → AROME
+    # Ncaled (28) → AROME Polyn (29) → DMI DINI (30) → ICON-EU (35) →
+    # WRF-SMN (40) → IFS (1000 — global catch-all).  NOAA RRQPE used to
+    # lead the chain at priority 5; it is now the global *observed*
+    # radar region (``sources/world/rrqpe``) and flows through the
+    # FrameStore / radar compositor instead of the NWP chain.
     nwp_contribs = collect_nwp_contributions(settings, nwp_cache_dir)
     nwp_grids_by_slug: dict[str, object] = {
         nwp_grid_slug(c): c.instance for c in nwp_contribs
@@ -843,7 +864,10 @@ async def lifespan(app: FastAPI):
             "Lightning chain: [%s]",
             ", ".join(c.name for c in lightning_contribs),
         )
-    enabled = settings.get_enabled_regions()
+    # The enabled set includes every always-on contribution region (the
+    # coarse global observed tier stays fetchable/renderable even under a
+    # narrow region spec).
+    enabled = enabled_regions_with_always_on(settings)
 
     # Precompute radar station coverage masks used by the ECMWF fallback
     # to distinguish "outside radar range" from "clear sky within range".
@@ -1228,6 +1252,20 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     )
 
 
+def _describe_worker_exit(exitcode: int) -> str:
+    """Human-readable reason for a render worker exit code."""
+    if exitcode < 0:
+        signum = -exitcode
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = f"signal {signum}"
+        if signum == signal.SIGKILL:
+            return f"killed by {signame} (exit code {exitcode}) - OOM-killed or externally killed"
+        return f"killed by {signame} (exit code {exitcode})"
+    return f"exit status {exitcode}"
+
+
 def main():
     import uvicorn
     # Optional direct TLS: only enabled when both cert and key are set.
@@ -1238,11 +1276,73 @@ def main():
             "ssl_certfile": settings.ssl_certfile,
             "ssl_keyfile": settings.ssl_keyfile,
         }
+    if settings.workers > 1:
+        # uvicorn logs worker deaths at INFO without the exit code, and the
+        # rotating file handler only records WARNING+, so nothing durable
+        # captures why a render worker died. Swap in a supervisor subclass
+        # that logs the reaped worker's exit code/signal at WARNING.
+        # Guarded for uvicorn versions whose supervisor lacks this method.
+        # NOTE: ``import uvicorn.main`` binds the click Command (uvicorn's
+        # __init__ re-exports ``main``), so the module - and its
+        # call-time ``Multiprocess`` global - is reached via importlib.
+        import importlib
+
+        uvicorn_main = importlib.import_module("uvicorn.main")
+        base_supervisor = uvicorn_main.Multiprocess
+        if hasattr(base_supervisor, "keep_subprocess_alive"):
+
+            class _DeathLoggingMultiprocess(base_supervisor):
+                """Multiprocess supervisor that logs worker death reasons."""
+
+                def __init__(self, *args, **kwargs):
+                    super().__init__(*args, **kwargs)
+                    self._last_mem_ctx = describe_cgroup_memory()
+
+                def keep_subprocess_alive(self) -> None:
+                    # Fresh memory context each tick so the death line
+                    # reflects the cgroup state just before the kill.
+                    self._last_mem_ctx = describe_cgroup_memory()
+                    # Snapshot liveness BEFORE the reap: uvicorn replaces the
+                    # wrapper in self.processes the same tick it reaps, so each
+                    # snapshot entry is processed exactly once and needs no
+                    # prior-exitcode gate (exitcode is a polling property and
+                    # would otherwise self-swallow genuine deaths).
+                    before = [
+                        (p, p.process.pid, p.process.is_alive())
+                        for p in self.processes
+                    ]
+                    super().keep_subprocess_alive()
+                    for process, pid, was_alive in before:
+                        exitcode = process.exitcode
+                        if exitcode is None or exitcode == 3:
+                            # Still alive this tick, or a STARTUP_FAILURE that
+                            # uvicorn already reports at ERROR before stopping.
+                            continue
+                        if was_alive and exitcode == -signal.SIGKILL:
+                            # Alive but unresponsive: uvicorn's master sent the
+                            # SIGKILL itself (healthcheck ping timeout), so the
+                            # kernel log shows no OOM entry.
+                            reason = (
+                                "unresponsive to healthcheck; "
+                                "killed by supervisor (SIGKILL)"
+                            )
+                        else:
+                            reason = _describe_worker_exit(exitcode)
+                        suffix = f" ({self._last_mem_ctx})" if self._last_mem_ctx else ""
+                        logger.warning(
+                            "Render worker [pid=%d] died: %s; respawning a replacement%s",
+                            pid,
+                            reason,
+                            suffix,
+                        )
+
+            uvicorn_main.Multiprocess = _DeathLoggingMultiprocess
     uvicorn.run(
         "librewxr.main:app",
         host=settings.host,
         port=settings.port,
         workers=settings.workers,
+        timeout_worker_healthcheck=settings.worker_healthcheck_timeout,
         log_level="info",
         access_log=False,
         # Don't let uvicorn install its own handlers/format — its loggers

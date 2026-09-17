@@ -29,7 +29,7 @@ pytest tests/test_renderer.py     # single file
 pytest -k "test_tile_render"      # by name pattern
 ```
 
-Test markers (defined in `pyproject.toml`): `api`, `ecmwf`, `nowcast`, `sources`, `tiles`, `store`, `hrrr`, `hrrr_alaska`, `icon_eu`, `dmi_dini`, `hrdps`, `arome_antilles`, `arome_guyane`, `arome_indien`, `arome_ncaled`, `arome_polyn`, `wrf_smn`, `jma_msm`, `alerts`.
+Test markers (defined in `pyproject.toml`): `api`, `ecmwf`, `nowcast`, `sources`, `tiles`, `store`, `hrrr`, `hrrr_alaska`, `icon_eu`, `dmi_dini`, `hrdps`, `arome_antilles`, `arome_guyane`, `arome_indien`, `arome_ncaled`, `arome_polyn`, `wrf_smn`, `jma_msm`, `rrqpe`, `alerts`, `mcp`, `storm_cells`.
 
 All tests are auto-async (`asyncio_mode = "auto"` in pyproject.toml). No explicit `@pytest.mark.asyncio` needed on individual async tests (though some older tests still have it).
 
@@ -53,6 +53,7 @@ src/librewxr/
       arome.py                            # AROMEOverseasGrid (all 5 AROME-OM variants)
     __init__.py                           # Discovery walker, registry, helpers
     world/ifs/                            # ECMWF IFS (global, NWP)
+    world/rrqpe/                          # NOAA Enterprise Rain Rate blend (global observed-precip radar region)
     satellite/gmgsi/                      # NOAA GMGSI (global, LW + VIS composite)
     regional/
       africa/nwp/arome_indien/            # AROME Indien (RE+YT+KM+MG+SW Indian Ocean)
@@ -86,6 +87,7 @@ src/librewxr/
     retry.py         # Backoff helper
   tiles/
     renderer.py      # On-demand tile rendering (compute / present split)
+    window.py        # Lat/lon-centered window stitching (RainViewer point-tile API)
     satellite_renderer.py  # GMGSI VIS-over-LW composite tiles
     cache.py         # Byte-capped LRU tile cache (stores TileGeometry)
     coordinates.py   # Tile/region coordinate transforms
@@ -110,12 +112,12 @@ Docker Compose uses profiles: `COMPOSE_PROFILES=single` or `COMPOSE_PROFILES=mul
 - **Entry points:** `python -m librewxr.main` (renderer/server); `python -m librewxr.data_pipeline` (multi-mode fetcher)
 - **Auto-discovery:** `sources/__init__.py` walks the `sources/` tree and registers radar/NWP/satellite providers automatically. Adding a source requires no changes to `fetcher.py`, `routes.py`, or `main.py`.
 - **Shared state wiring:** Lifespan functions in `main.py` create all singletons and assign them to `routes` module-level vars — dependencies are NOT injected via FastAPI's DI. Two variants exist: `lifespan` (single mode + multi fetcher parent) and `_render_only_lifespan` (multi renderer workers; leaves fetch-side singletons as `None`). Key vars: `frame_store`, `tile_cache`, `nwp_grids` (dict by slug), `ecmwf_grid`, `nwp_chain`, `satellite_grids`, `nowcast_store`, `alerts_store`, `alerts_fetcher`, `tile_request_tracker`, `tile_warmer`, `radar_cache`, `radar_fetcher`, `enabled_regions`, `alerts_enabled`. (`tile_warmer` is `None` in multi-mode render workers — the warm path is single-mode only).
-- **NWP chain:** Priority-ordered sources: HRRR (10) → HRRR-Alaska (11) → HRDPS (20) → JMA MSM (20) → AROME Antilles (25) → AROME Guyane (26) → AROME Indien (27) → AROME Ncaled (28) → AROME Polyn (29) → DMI DINI (30) → ICON-EU (35) → WRF-SMN (40) → IFS (1000, global catch-all). `NWPChain` dispatches narrowest-domain-first.
-- **Radar regions:** US (USCOMP, AKCOMP, HICOMP, PRCOMP, GUCOMP), Canada (CACOMP), Central America (SVCOMP), Europe (OPERA + ITCOMP — Italy via DPC, finer `pixel_size` so it precedes OPERA in the multi-region compositor), Japan (JPCOMP — JMA HRPN analysis leg), Taiwan (TWCOMP), SE Asia (MYPENINSULAR, MYEAST). Region groups: CONUS, US, CANADA, CENTRAL_AMERICA, EUROPE, JAPAN, SOUTHEAST_ASIA, TAIWAN, ALL.
+- **NWP chain:** Priority-ordered sources: HRRR (10) → HRRR-Alaska (11) → HRDPS (20) → JMA MSM (20) → AROME Antilles (25) → AROME Guyane (26) → AROME Indien (27) → AROME Ncaled (28) → AROME Polyn (29) → DMI DINI (30) → ICON-EU (35) → WRF-SMN (40) → IFS (1000, the terminal model of the chain). `NWPChain` dispatches narrowest-domain-first. The model layer fills past frames only (a) poleward of the RRQPE band, (b) in the 2-degree fringe excluded by RRQPE's coverage polygon (68-70N, -60 to -58S), and (c) when RRQPE declines (missed scans / stale store) — within the 60S-70N band, RRQPE (next bullet) is the always-on global observed radar region at the bottom compositing tier.
+- **Radar regions:** US (USCOMP, AKCOMP, HICOMP, PRCOMP, GUCOMP), Canada (CACOMP), Central America (SVCOMP), Europe (OPERA + ITCOMP — Italy via DPC, finer `pixel_size` so it precedes OPERA in the multi-region compositor), Japan (JPCOMP — JMA HRPN analysis leg), Taiwan (TWCOMP), SE Asia (MYPENINSULAR, MYEAST), plus RRQPE — the always-on global observed-precip band (60S-70N, all longitudes) whose coarsest `pixel_size` sorts it last in the multi-region compositor (it fills only pixels no finer radar region claims) and joins nowcast extrapolation like any region. Region groups: CONUS, US, CANADA, CENTRAL_AMERICA, EUROPE, JAPAN, SOUTHEAST_ASIA, TAIWAN, ALL.
 - **Data encoding:** Radar frames are `dict[str, np.ndarray]` keyed by region name, stored as uint8 dBZ values.
-- **Tile rendering:** Compute / present split — `compute_tile_geometry` does the expensive work (region sampling, multi-region compositing, NWP fill/blend, noise-floor masking, optional snow mask) and returns a `TileGeometry` dataclass. `present_tile` does the cheap per-request tail (LUT colorize, Gaussian blur, optional motion-arrow overlay, encode). The `TileCache` stores `TileGeometry` records (not encoded bytes) so one cached entry serves every visual variant.
+- **Tile rendering:** Compute / present split — `compute_tile_geometry` does the expensive work (region sampling, multi-region compositing — RRQPE is the always-on global observed bottom tier within the 60S-70N band, filling only pixels no finer radar region claims — NWP fill/blend, noise-floor masking, optional snow mask) and returns a `TileGeometry` dataclass. `present_tile` does the cheap per-request tail (LUT colorize, Gaussian blur, optional motion-arrow overlay, encode). The `TileCache` stores `TileGeometry` records (not encoded bytes) so one cached entry serves every visual variant. NWP fill/blend therefore applies to the polar fringe outside the RRQPE band, to RRQPE-decline pixels, and to the nowcast blend tail.
 - **Satellite:** NOAA GMGSI hourly global mosaic (LW + VIS), composited at render time as VIS-over-LW with a natural day/night terminator. Latitude grid is Mercator-spaced.
-- **Nowcasting:** Radar extrapolation + IFS blending with spatial feathering at radar boundaries.
+- **Nowcasting:** Radar extrapolation + IFS blending with spatial feathering at radar boundaries. Full-longitude regions (`RegionDef.is_global`, e.g. the global RRQPE band) get wrap-aware optical flow and remap so content advecting across the ±180° seam re-enters on the other side instead of zeroing at a hard edge.
 - **Memory:** Heavily uses numpy memmap (temp files) for radar frames, ECMWF grids, and nowcast data. Memory monitor is cgroup-aware for multi-worker. See docker-compose.yml for RAM guidance.
 - **Tile warming (single mode):** Two separate thread pools — one for on-demand requests, one for background tile warming — so requests never queue behind warming tasks. Warmer pre-computes geometry only. This is single-mode-only; in multi mode the fetcher and renderers are separate processes and no TileWarmer is instantiated — the empty-tile fast path and per-worker LRU caches cover the cold-render case instead.
 - **Weather alerts:** WMO CAP alerts via `alerts_fetcher.py` (async HTTP) + `alerts_store.py`. In multi mode, pipeline owns fetching; render workers read via `state.json` snapshot.
@@ -161,6 +163,8 @@ All config via `LIBREWXR_*` env vars or `.env` file. Settings defined in `src/li
 - `LIBREWXR_NOWCAST_ENABLED`: default true
 - `LIBREWXR_NOWCAST_FRAMES`: default 6 (10-min forecast frames)
 - `LIBREWXR_NOWCAST_BLEND_MODE`: `radar`, `blended` (default), or `model` — radar extrapolation only, radar+IFS blend, or IFS-only nowcast composition
+- `LIBREWXR_NOWCAST_COARSEN_ENABLED`: lead-time-ramped Gaussian coarsening of extrapolated radar (default true)
+- `LIBREWXR_NOWCAST_COARSEN_MAX_KM`: effective resolution floor at the last blend step (default 3.0)
 - `LIBREWXR_ARROW_FLOW_ENABLED`: render motion-arrow overlay on nowcast tiles (default true)
 
 **Alerts:**
@@ -176,6 +180,7 @@ All config via `LIBREWXR_*` env vars or `.env` file. Settings defined in `src/li
 - `LIBREWXR_COORD_STORE_ENABLED`: shared on-disk coordinate store (default true; false reverts to per-worker in-process caches; requires `LIBREWXR_CACHE_DIR`)
 - `LIBREWXR_COORD_STORE_MB`: shared coord-store size cap (0 = mode default: 1024 single / 8192 multi; soft cap, pruned once per fetch cycle; multi budget shared by all render workers)
 - `LIBREWXR_LOG_LEVEL`: root log level (DEBUG/INFO/WARNING/ERROR/CRITICAL, default INFO; case-insensitive; per-cycle noise logs at DEBUG)
+- `LIBREWXR_LOG_FILE`: rotating WARNING+ log file (default logs/librewxr.log; empty = disabled; compose bind-mounts ./logs so it lands in the clone directory)
 
 ## Adding a New Source
 
@@ -193,5 +198,7 @@ The discovery walker picks up the new package automatically — no per-source pl
 
 - **File headers:** `# SPDX-License-Identifier: AGPL-3.0-or-later` + `# Copyright (C) 2026 Joshua Kimsey` on every source file
 - **Commit style:** imperative mood, concise (e.g., "Add precipitation motion arrows")
+- **Commit sign-off:** every commit must carry a `Signed-off-by:` trailer (`git commit -s`) whose name and email match the commit author identity; enforced on pull requests by `.github/workflows/dco.yml`.
+- **Contribution licensing:** LibreWXR is dual-licensed (AGPL-3.0-or-later plus a separate commercial license offered by the maintainer). Contributions are governed by the license grant in CONTRIBUTING.md, restated as required checkboxes in `.github/PULL_REQUEST_TEMPLATE.md`; do not weaken or bypass those terms.
 - **Docker:** `docker compose up --build` with `COMPOSE_PROFILES=single` (default) or `COMPOSE_PROFILES=multi`. Exposes port 8080 (configurable via `LIBREWXR_PORT`). Use `docker compose run --rm clear-cache` to wipe caches.
 - **Docs:** `docs/adding-a-source.md`, `docs/configuration-reference.md`, `docs/satellite-implementation-plan.md`, `docs/coverage.md`, `docs/rainviewer-migration-guide.md`, `docs/web-integration-guide.md`, `docs/source-survey.md`, `docs/self-host-sizing.md`

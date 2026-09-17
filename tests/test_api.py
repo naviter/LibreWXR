@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 Joshua Kimsey
+import asyncio
 import time
 
 import numpy as np
@@ -11,6 +12,7 @@ pytestmark = pytest.mark.api
 
 from librewxr.api import routes
 from librewxr.config import settings
+from librewxr.data.nowcast import NowcastFrame, NowcastStore
 from librewxr.data.store import FrameStore, RadarFrame
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import COMPOSITE_HEIGHT, COMPOSITE_WIDTH
@@ -80,12 +82,43 @@ class _StubStormCellStore:
         self._cells = {region: cell}
         self._counts = {region: 1}
         self.detected_at_timestamp = detected_at
+        # Content version for the detected cells (mirrors the real
+        # StormCellStore's read-only property surface used by the overlay
+        # cache keying).
+        self.cells_version = 0
 
     async def get_cells(self) -> dict[str, np.ndarray]:
         return dict(self._cells)
 
     async def get_counts(self) -> dict[str, int]:
         return dict(self._counts)
+
+
+class _StubNowcastStore:
+    """Duck-typed NowcastStore holding a constant radar flow field.
+
+    Enough of the real surface for the arrow overlay path: per-region
+    flows (constant eastward motion at reduced resolution, so arrows are
+    actually drawn on the fixture tile), no composite NWP flow, and a
+    mutable ``flow_version`` so tests can simulate a pipeline
+    regeneration re-keying the overlay cache.
+    """
+
+    def __init__(self, flow_version: int = 1) -> None:
+        self.flow_version = flow_version
+        flow = np.zeros((2, 2, 2), dtype=np.float32)
+        flow[..., 0] = 3.0  # constant eastward motion
+        self._flows = {"USCOMP": flow}
+        self._nwp_flow = None
+
+    async def get_flows(self) -> dict[str, np.ndarray]:
+        return dict(self._flows)
+
+    async def get_nwp_flow(self) -> np.ndarray | None:
+        return self._nwp_flow
+
+    async def get_frame(self, timestamp: int):
+        return None, 0.0
 
 
 def _make_test_app() -> tuple[FastAPI, FrameStore, TileCache, int, int]:
@@ -159,6 +192,48 @@ class TestWeatherMapsEndpoint:
         assert past[0]["time"] == ts_prev
         assert past[0]["path"] == f"/v2/radar/{ts_prev}"
 
+    def test_nowcast_excludes_overlapping_past_timestamp(self, client, monkeypatch):
+        """Regression: during the nowcast-regeneration window the store is
+        still anchored to the previous cycle, so a nowcast slot equal to the
+        newest past frame must not be advertised as both past and nowcast."""
+        c, ts, _ = client
+        store = NowcastStore()
+        asyncio.run(store.replace_all([
+            NowcastFrame(timestamp=ts),
+            NowcastFrame(timestamp=ts + 600),
+            NowcastFrame(timestamp=ts + 1200),
+        ]))
+        monkeypatch.setattr(routes, "nowcast_store", store)
+        resp = c.get("/public/weather-maps.json")
+        data = resp.json()
+        nowcast = data["radar"]["nowcast"]
+        assert all(entry["time"] > ts for entry in nowcast)
+        assert nowcast[0]["time"] == ts + 600
+        assert len(nowcast) == 2
+        assert [entry["path"] for entry in nowcast] == [
+            f"/v2/radar/{ts + 600}",
+            f"/v2/radar/{ts + 1200}",
+        ]
+
+    def test_nowcast_future_timestamps_untouched(self, client, monkeypatch):
+        """Nowcast slots strictly newer than the newest past frame survive
+        unchanged and in order."""
+        c, ts, _ = client
+        store = NowcastStore()
+        asyncio.run(store.replace_all([
+            NowcastFrame(timestamp=ts + 600),
+            NowcastFrame(timestamp=ts + 1200),
+        ]))
+        monkeypatch.setattr(routes, "nowcast_store", store)
+        resp = c.get("/public/weather-maps.json")
+        data = resp.json()
+        nowcast = data["radar"]["nowcast"]
+        assert [entry["time"] for entry in nowcast] == [ts + 600, ts + 1200]
+        assert [entry["path"] for entry in nowcast] == [
+            f"/v2/radar/{ts + 600}",
+            f"/v2/radar/{ts + 1200}",
+        ]
+
 
 class TestRadarTileEndpoint:
     def test_valid_tile_request(self, client):
@@ -192,6 +267,36 @@ class TestRadarTileEndpoint:
         assert resp.status_code == 200
         assert "cache-control" in resp.headers
         assert "max-age=7200" in resp.headers["cache-control"]
+
+    def test_timestamp_zero_serves_latest(self, client):
+        c, ts, ts_prev = client
+        resp = c.get("/v2/radar/0/256/4/3/5/2/0_0.png")
+        assert resp.status_code == 200
+        assert resp.headers["x-frame-timestamp"] == str(ts)
+        assert resp.content == c.get(f"/v2/radar/{ts}/256/4/3/5/2/0_0.png").content
+
+    def test_timestamp_zero_cache_header(self, client):
+        """The resolved latest frame must NOT get the 7200 historical bucket."""
+        c, ts, ts_prev = client
+        resp = c.get("/v2/radar/0/256/4/3/5/2/0_0.png")
+        assert resp.status_code == 200
+        assert "max-age=300" in resp.headers["cache-control"]
+
+    def test_canonical_url_has_frame_timestamp_header(self, client):
+        c, ts, ts_prev = client
+        resp = c.get(f"/v2/radar/{ts}/256/4/3/5/2/0_0.png")
+        assert resp.status_code == 200
+        assert resp.headers["x-frame-timestamp"] == str(ts)
+
+    def test_timestamp_zero_304_keeps_header(self, client):
+        c, ts, ts_prev = client
+        url = "/v2/radar/0/256/4/3/5/2/0_0.png"
+        first = c.get(url)
+        assert first.status_code == 200
+        etag = first.headers["etag"]
+        resp = c.get(url, headers={"If-None-Match": etag})
+        assert resp.status_code == 304
+        assert resp.headers["x-frame-timestamp"] == str(ts)
 
     def test_radar_tile_has_etag(self, client):
         c, ts, _ = client
@@ -291,6 +396,62 @@ class TestRadarTileEndpoint:
         url = f"/v2/radar/{ts_prev}/256/4/3/6/2/0_0.png"
         assert c.get(f"{url}?cells=1").content == c.get(url).content
 
+    def test_past_frame_arrows_cached_in_worker(self, client, monkeypatch):
+        """Past-frame overlay requests now cache: the first renders, the
+        second is served from the in-worker cache without re-presenting
+        (previously past-frame overlays re-rendered per request)."""
+        c, _, ts_prev = client
+        url = f"/v2/radar/{ts_prev}/256/4/3/6/2/0_0.png?arrows=1"
+        monkeypatch.setattr(routes, "nowcast_store", _StubNowcastStore())
+        routes.tile_cache.clear()
+
+        first = c.get(url)
+        assert first.status_code == 200
+
+        # Second request must not run the present stage - in-worker cache hit.
+        def _present_must_not_run(*_args, **_kwargs):
+            raise AssertionError("present ran on a cached overlay hit")
+
+        monkeypatch.setattr(routes, "_present_tile_async", _present_must_not_run)
+        second = c.get(url)
+        assert second.status_code == 200
+        assert second.content == first.content
+
+    def test_flow_version_bump_rekeys_overlay(self, client, monkeypatch):
+        """Bumping ``flow_version`` re-keys the overlay so the next request
+        re-renders instead of serving the previous flow's cached bytes."""
+        c, _, ts_prev = client
+        url = f"/v2/radar/{ts_prev}/256/4/3/6/2/0_0.png?arrows=1"
+        stub = _StubNowcastStore(flow_version=1)
+        monkeypatch.setattr(routes, "nowcast_store", stub)
+        routes.tile_cache.clear()
+
+        orig_present = routes._present_tile_async
+        calls = {"present": 0}
+
+        async def counting_present(*args, **kwargs):
+            calls["present"] += 1
+            return await orig_present(*args, **kwargs)
+
+        monkeypatch.setattr(routes, "_present_tile_async", counting_present)
+
+        first = c.get(url)
+        assert first.status_code == 200
+        assert calls["present"] == 1
+
+        # Repeat under the same flow version: in-worker cache hit.
+        repeat = c.get(url)
+        assert repeat.status_code == 200
+        assert repeat.content == first.content
+        assert calls["present"] == 1
+
+        # Pipeline regenerates flows: new version -> new key -> re-render.
+        stub.flow_version = 2
+        again = c.get(url)
+        assert again.status_code == 200
+        assert again.content == first.content
+        assert calls["present"] == 2
+
 
 class TestCoverageTileEndpoint:
     def test_valid_coverage_request(self, client):
@@ -343,6 +504,14 @@ class TestSatelliteTileEndpoint:
         assert resp.content == b""
         assert resp.headers.get("etag") == etag
         assert resp.headers.get("cache-control", "").startswith("public, max-age=")
+
+    def test_satellite_timestamp_zero_serves_latest(self, client):
+        c, ts, _ = client
+        resp = c.get("/v2/satellite/0/256/4/3/5/0/0_0.png")
+        assert resp.status_code == 200
+        assert resp.headers["x-frame-timestamp"] == str(ts)
+        assert "max-age=300" in resp.headers["cache-control"]
+        assert resp.content == c.get(f"/v2/satellite/{ts}/256/4/3/5/0/0_0.png").content
 
 
 class TestHealthEndpoint:
@@ -695,6 +864,59 @@ class TestSharedTileStoreIntegration:
             raise AssertionError("compute_tile_geometry ran on a shared-store hit")
 
         monkeypatch.setattr(routes, "compute_tile_geometry", _compute_must_not_run)
+        routes.tile_cache.clear()
+        second = c.get(url)
+        assert second.status_code == 200
+        assert second.content == first.content
+
+    def test_shared_store_serves_overlay_without_recompute(self, client, tmp_path, monkeypatch):
+        """A past-frame overlay render publishes to the shared store under
+        a flow/cells-versioned key and a second request serves from it.
+
+        The present monkeypatch hard-fails, so the only way the second
+        request can return 200 with byte-identical content is a
+        shared-store hit - proving the overlay encode (not a re-render)
+        was reused.
+        """
+        from librewxr.tiles.shared_tile_store import SharedTileStore
+
+        c, _, ts_prev = client
+        url = f"/v2/radar/{ts_prev}/256/4/3/6/2/0_0.png?arrows=1"
+        store = SharedTileStore(tmp_path, max_mb=64)
+        monkeypatch.setattr(routes, "shared_tile_store", store)
+        stub = _StubNowcastStore(flow_version=1)
+        monkeypatch.setattr(routes, "nowcast_store", stub)
+        routes.tile_cache.clear()
+
+        # Cold in-memory caches force a full compute + present, which
+        # publishes the fresh overlay encode to the shared store
+        # (fire-and-forget background task in the handler).
+        first = c.get(url)
+        assert first.status_code == 200
+
+        # Wait for the background publish to land (it runs on the
+        # TestClient's event loop, not this thread).
+        deadline = time.monotonic() + 5.0
+        while store.size < 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert store.size == 1, "past-frame overlay tile was not published"
+
+        # Key shape: ts prefix + frame version + flow/cells version
+        # segments (arrow_style/cell_style tail included).
+        entries = list(store.root.rglob("*.tile"))
+        assert len(entries) == 1
+        key = entries[0].stem
+        assert key.startswith(f"{ts_prev}-")
+        assert "-f1-" in key
+        assert "-c0-" in key
+        assert "-alight-k" in key
+
+        # "Second worker": in-memory caches cleared and present
+        # hard-failing - success can only come from the shared store.
+        def _present_must_not_run(*_args, **_kwargs):
+            raise AssertionError("present ran on a shared-store overlay hit")
+
+        monkeypatch.setattr(routes, "_present_tile_async", _present_must_not_run)
         routes.tile_cache.clear()
         second = c.get(url)
         assert second.status_code == 200

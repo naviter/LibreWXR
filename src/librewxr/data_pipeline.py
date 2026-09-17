@@ -41,6 +41,7 @@ from librewxr.data.master_state import snapshot_state, write_state_snapshot
 from librewxr.data.nowcast import NowcastGenerator, NowcastStore
 from librewxr.data.storm_cells import StormCellGenerator, StormCellStore
 from librewxr.data.nwp_source import NWPChain
+from librewxr.data.pagecache import prime_fresh_memmaps
 from librewxr.data.precip_mask import PrecipMaskStore
 from librewxr.data.radar_cache import RadarFrameCache
 from librewxr.data.regions import REGIONS
@@ -52,12 +53,14 @@ from librewxr.sources import (
     collect_nwp_contributions,
     collect_radar_coverage_metadata,
     collect_satellite_contributions,
+    enabled_regions_with_always_on,
     lightning_source_slug,
     nwp_grid_slug,
     satellite_source_slug,
 )
 from librewxr.tiles.cache import TileCache
 from librewxr.tiles.coordinates import prune_shared_coord_store
+from librewxr.tiles.shared_tile_store import SharedTileStore
 
 # The pipeline writes no tiles itself, but RadarFetcher invalidates a
 # TileCache on frame eviction.  A shared one here would be useless to
@@ -83,7 +86,10 @@ async def run_pipeline() -> None:
     cache_dir = Path(settings.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    enabled = settings.get_enabled_regions()
+    # The enabled set includes every always-on contribution region (the
+    # coarse global observed tier stays fetchable even under a narrow
+    # region spec).
+    enabled = enabled_regions_with_always_on(settings)
     logger.info(
         "Pipeline starting (cache_dir=%s, regions=%s, fetch_interval=%ds)",
         cache_dir, ", ".join(enabled), settings.fetch_interval,
@@ -218,6 +224,13 @@ async def run_pipeline() -> None:
     # touching the NWP chain.  Multi-mode only.
     precip_mask_store = PrecipMaskStore(cache_dir=cache_dir)
 
+    # Mirrors the render-worker budget resolution in main.py; the
+    # pipeline holds the handle solely to own pruning (it never reads
+    # or publishes tiles).
+    mb = settings.shared_tile_store_mb
+    mb = 2048 if mb is None else mb
+    shared_tiles = SharedTileStore(cache_dir, max_mb=mb) if mb > 0 else None
+
     # Stores keyed by slug — render-only workers consume the same keys
     # via ``apply_state``.  None entries are skipped by snapshot_state.
     stores = {
@@ -245,11 +258,29 @@ async def run_pipeline() -> None:
             await asyncio.to_thread(write_state_snapshot, payload, cache_dir)
         except Exception:
             logger.exception("Failed to dump master state snapshot")
+        # Prime freshly written memmap frames into the host page cache so
+        # render workers don't cold-fault on a slow backing disk (the host
+        # page cache is shared between the pipeline and renderer
+        # containers).  Best-effort — a failure must never break the cycle.
+        if settings.pagecache_prime_enabled:
+            try:
+                primed = await asyncio.to_thread(
+                    prime_fresh_memmaps, payload, cache_dir
+                )
+                if primed:
+                    logger.info("Primed page cache for %d bytes of frame files", primed)
+            except Exception:
+                logger.exception("Failed to prime page cache")
         # The pipeline owns coord-store maintenance in multi mode (render
         # workers never prune).  Guard-free: _get_store()'s gate covers
         # enabled/cache_dir and the helper never raises.  The directory
         # scans run in a worker thread so they never block the loop.
         await asyncio.to_thread(prune_shared_coord_store)
+        # The pipeline is the sole pruner of the shared tile store (render
+        # workers only invalidate by timestamp / sweep on a full clear);
+        # prune full-scans the shard tree so it stays off the event loop.
+        if shared_tiles is not None:
+            await asyncio.to_thread(shared_tiles.prune)
 
     fetcher = RadarFetcher(
         store, tile_cache,
@@ -315,8 +346,12 @@ async def run_pipeline() -> None:
 
 def main() -> None:
     setup_logging()
-    # The pipeline's heavy cv2 work (Farneback nowcast flow) runs once per fetch cycle; 8 threads is ample for the <=1000px flow grids and stays well inside the pipeline container's CPU cap.
-    cv2.setNumThreads(8)
+    # The pipeline's heavy cv2 work (Farneback nowcast flow + cv2.remap
+    # warps) runs once per fetch cycle, now overlapped across the 4-worker
+    # nowcast pool (regions and steps run in parallel).  4 workers × 2 cv2
+    # threads keeps the aggregate cv2 thread count at the previous 8,
+    # respecting the pipeline container's CPU cap.
+    cv2.setNumThreads(2)
     try:
         asyncio.run(run_pipeline())
     except KeyboardInterrupt:
