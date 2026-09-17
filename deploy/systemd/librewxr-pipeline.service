@@ -1,0 +1,26 @@
+# Installed by scripts/deploy.sh into /etc/systemd/system (with nofile.conf as a drop-in).
+[Unit]
+Description=LibreWXR data pipeline (fetcher / nowcast / state writer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/srv/librewxr
+# Secrets (EUMETSAT) live only in the box .env; the tracked settings file is
+# loaded after it, so its values win (see deploy/librewxr.env).
+EnvironmentFile=/srv/librewxr/.env
+EnvironmentFile=/srv/librewxr/deploy/librewxr.env
+Environment=EARTHKIT_REGRID_CACHE_DIR=/srv/data/earthkit-cache
+Environment=TMPDIR=/srv/data/tmp
+ExecStart=/srv/librewxr/.venv312/bin/python -m librewxr.data_pipeline
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=librewxr-pipeline
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,28 @@
+# Installed by scripts/deploy.sh into /etc/systemd/system (with nofile.conf as a drop-in).
+[Unit]
+Description=LibreWXR render workers (tile server, render-only)
+After=network-online.target librewxr-pipeline.service
+Wants=network-online.target
+Wants=librewxr-pipeline.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/srv/librewxr
+# Secrets (EUMETSAT) live only in the box .env; the tracked settings file is
+# loaded after it, so its values win (see deploy/librewxr.env).
+EnvironmentFile=/srv/librewxr/.env
+EnvironmentFile=/srv/librewxr/deploy/librewxr.env
+Environment=LIBREWXR_RENDER_ONLY=1
+Environment=EARTHKIT_REGRID_CACHE_DIR=/srv/data/earthkit-cache
+Environment=TMPDIR=/srv/data/tmp
+ExecStart=/srv/librewxr/.venv312/bin/python -m librewxr.main
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=librewxr-render
+
+[Install]
+WantedBy=multi-user.target
